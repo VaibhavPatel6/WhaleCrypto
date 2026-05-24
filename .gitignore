@@ -1,0 +1,5 @@
+*.pem
+env
+trade_history.json
+__pycache__/
+*.pyc
