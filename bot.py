@@ -36,10 +36,11 @@ import math
 import time
 import re
 import os
+import subprocess
 import logging
 import json
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 from pathlib import Path
 
@@ -60,15 +61,38 @@ logger = logging.getLogger("whale_crypto")
 EDGE_THRESHOLD     = float(os.getenv("EDGE_THRESHOLD",      "0.10"))   # 10% min edge over ask price
 MAX_OTM_PCT        = float(os.getenv("MAX_OTM_PCT",         "0.04"))   # ignore strikes >4% from RTI
 MAX_DIVERGENCE     = float(os.getenv("MAX_DIVERGENCE",      "0.35"))   # skip if model vs mid > 35%
-MAX_POSITION_USD   = float(os.getenv("MAX_POSITION_USD",    "50"))     # $ at risk per order
+MAX_POSITION_USD   = float(os.getenv("MAX_POSITION_USD",    "50"))     # $ at risk per single order leg
 MAX_CONTRACTS      = int(os.getenv("MAX_CONTRACTS",         "200"))    # hard cap per order
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS",    "5"))
+MAX_PORTFOLIO_PCT  = float(os.getenv("MAX_PORTFOLIO_PCT",   "0.10"))   # max % of balance to risk per session
 SCAN_INTERVAL      = int(os.getenv("SCAN_INTERVAL_SECONDS", "60"))
 MIN_MINUTES        = float(os.getenv("MIN_MINUTES",         "60"))     # at least 1h to close
 MAX_MINUTES        = float(os.getenv("MAX_MINUTES",         "1500"))   # at most ~25h to close
 KALSHI_FEE         = 0.007                                             # ~0.7% taker fee
 
-CRYPTO_SERIES = {"BTC": "KXBTC", "ETH": "KXETH"}
+# All known Kalshi crypto series: asset symbol → Kalshi series ticker
+# The bot will try each one and silently skip any with no open markets.
+CRYPTO_SERIES: dict[str, str] = {
+    "BTC":  "KXBTC",
+    "ETH":  "KXETH",
+    "SOL":  "KXSOL",
+    "XRP":  "KXXRP",
+    "DOGE": "KXDOGE",
+    "AVAX": "KXAVAX",
+    "LINK": "KXLINK",
+    "LTC":  "KXLTC",
+}
+
+# Strike grid for each asset — Kalshi only lists real markets at these increments.
+# Anything in between is a ghost market with stale orders. Skip them.
+# XRP strikes end in .XX99500 with $0.02 spacing — checked via remainder ~0.00995.
+STRIKE_STEP: dict[str, float] = {
+    "BTC":  250,    # $74,750 / $75,000 / $75,250 ...
+    "ETH":  40,     # $2,080 / $2,120 / $2,160 ...
+    "SOL":  1,      # $180 / $181 / $182 ...
+    "XRP":  0.02,   # $1.3099500 / $1.3299500 ... (offset ~0.00995 from round cents)
+    "DOGE": 0.005,  # typical DOGE increment
+}
 
 HISTORY_FILE = Path("trade_history.json")
 
@@ -174,6 +198,9 @@ class WhaleCryptoBot:
         self.feed    = feed
         self.dry_run = dry_run
         self.history: list[dict] = []
+        self._placed: set[str] = set()      # "ticker_side" keys already traded this session
+        self._session_exposure: float = 0.0  # total dollars committed this session
+        self._portfolio_limit: float = float("inf")  # set from live balance in run()
         self._load_history()
 
     # ── Persistence ──────────────────────────────────────────────────────────────
@@ -183,6 +210,25 @@ class WhaleCryptoBot:
             try:
                 self.history = json.loads(HISTORY_FILE.read_text())
                 logger.info(f"Loaded {len(self.history)} past trades from {HISTORY_FILE}")
+                # Re-seed _placed so we don't re-enter positions that haven't expired yet.
+                # Use the recorded ts + minutes_left to compute expiry — no ticker parsing needed.
+                now = datetime.now(timezone.utc)
+                for rec in self.history:
+                    ticker       = rec.get("ticker", "")
+                    side         = rec.get("side", "")
+                    ts_str       = rec.get("ts", "")
+                    minutes_left = rec.get("minutes_left", 0)
+                    if not ts_str:
+                        continue
+                    try:
+                        placed_at = datetime.fromisoformat(ts_str)
+                        expiry    = placed_at + timedelta(minutes=minutes_left)
+                        if expiry > now:
+                            self._placed.add(f"{ticker}_{side}")
+                    except (ValueError, TypeError):
+                        pass
+                if self._placed:
+                    logger.info(f"Skipping {len(self._placed)} already-traded position(s) from prior run")
             except Exception:
                 self.history = []
 
@@ -219,6 +265,12 @@ class WhaleCryptoBot:
         if not parsed:
             return None
         above, threshold = parsed
+
+        # Skip ghost markets sitting between real Kalshi strikes
+        step = STRIKE_STEP.get(asset)
+        if step and round(threshold % step, 6) != 0:
+            logger.debug(f"Skip {ticker}: ${threshold} not on ${step} grid (ghost market)")
+            return None
 
         # Skip deep OTM strikes — spreads are wide and model error dominates
         if abs(threshold - spot) / spot > MAX_OTM_PCT:
@@ -300,6 +352,17 @@ class WhaleCryptoBot:
         signals.sort(key=lambda s: s.edge, reverse=True)
         return signals
 
+    # ── Notifications ────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _notify(title: str, message: str):
+        """Send a macOS desktop notification (silent no-op on other platforms)."""
+        try:
+            script = f'display notification "{message}" with title "{title}" sound name "Ping"'
+            subprocess.run(["osascript", "-e", script], capture_output=True, timeout=3)
+        except Exception:
+            pass  # Non-macOS or osascript unavailable — just skip
+
     # ── Execution ────────────────────────────────────────────────────────────────
 
     def _execute(self, sig: Signal) -> bool:
@@ -310,6 +373,14 @@ class WhaleCryptoBot:
             f"@ {sig.price:.2%} | RTI-fair={sig.fair_prob:.2%} | edge={sig.edge:.2%} | "
             f"strike ${sig.market.threshold:,.0f} {direction} | "
             f"{sig.market.minutes_left:.0f}min | exp_profit=${sig.expected_profit:.2f}"
+        )
+        mode_tag = "📋 Dry Run" if self.dry_run else "⚡ LIVE"
+        self._notify(
+            title=f"WhaleCrypto {mode_tag}",
+            message=(
+                f"{sig.market.asset} {sig.side.upper()} ${sig.market.threshold:,.0f} {direction} | "
+                f"edge {sig.edge:.0%} | {sig.contracts} contracts @ {sig.price:.0%}"
+            ),
         )
 
         record: dict = {
@@ -354,7 +425,7 @@ class WhaleCryptoBot:
     def scan_once(self):
         logger.info("─" * 64)
         try:
-            rtis = self.feed.get_prices()
+            rtis = self.feed.get_prices(list(CRYPTO_SERIES.keys()))
         except Exception as e:
             logger.error(f"Price feed error: {e}")
             return
@@ -383,18 +454,59 @@ class WhaleCryptoBot:
         for sig in signals:
             if executed >= MAX_OPEN_POSITIONS:
                 break
+            key          = f"{sig.market.ticker}_{sig.side}"
+            opposite_key = f"{sig.market.ticker}_{'yes' if sig.side == 'no' else 'no'}"
+            if key in self._placed:
+                logger.info(f"  Skip {sig.market.ticker} {sig.side.upper()} — already traded this session")
+                continue
+            if opposite_key in self._placed:
+                logger.info(f"  Skip {sig.market.ticker} {sig.side.upper()} — opposite side already traded (avoid wash)")
+                continue
+
+            # Portfolio budget guard
+            remaining = self._portfolio_limit - self._session_exposure
+            if remaining <= 0:
+                logger.info(
+                    f"Portfolio limit reached — ${self._session_exposure:.2f} committed "
+                    f"of ${self._portfolio_limit:.2f} allowed. Stopping."
+                )
+                break
+            max_affordable = int(remaining / sig.price)
+            if max_affordable < 1:
+                logger.info(
+                    f"  Skip {sig.market.ticker} {sig.side.upper()} — can't fit within remaining budget "
+                    f"(${remaining:.2f} left, price {sig.price:.0%})"
+                )
+                continue
+            sig.contracts = min(sig.contracts, max_affordable)
+            sig.expected_profit = sig.contracts * sig.edge
+
             if self._execute(sig):
+                self._placed.add(key)
+                self._session_exposure += sig.contracts * sig.price
                 executed += 1
 
     def run(self):
         mode = "DRY RUN — paper trading" if self.dry_run else "⚠ LIVE TRADING ⚠"
+
+        try:
+            balance = self.kalshi.get_balance()
+            self._portfolio_limit = balance * MAX_PORTFOLIO_PCT
+            balance_str = f"${balance:.2f}"
+            limit_str   = f"${self._portfolio_limit:.2f}"
+        except Exception as e:
+            logger.warning(f"Could not fetch balance ({e}) — no portfolio cap applied")
+            balance_str = "unknown"
+            limit_str   = "unlimited"
+
         logger.info("=" * 64)
         logger.info(f"WhaleCrypto Bot  [{mode}]")
         logger.info(f"  Price source : CF Benchmark RTI (constituent-exchange median)")
-        logger.info(f"  Assets       : {', '.join(CRYPTO_SERIES)}")
+        logger.info(f"  Assets       : {', '.join(CRYPTO_SERIES)}  ({len(CRYPTO_SERIES)} series)")
         logger.info(f"  Edge thresh  : {EDGE_THRESHOLD:.0%}")
         logger.info(f"  OTM filter   : ±{MAX_OTM_PCT:.0%} of RTI")
         logger.info(f"  Max position : ${MAX_POSITION_USD:.0f} per trade")
+        logger.info(f"  Portfolio cap: {MAX_PORTFOLIO_PCT:.0%} of balance = {limit_str} (balance: {balance_str})")
         logger.info(f"  Time window  : {MIN_MINUTES:.0f}–{MAX_MINUTES:.0f} min to close")
         logger.info(f"  Scan every   : {SCAN_INTERVAL}s")
         logger.info("=" * 64)
