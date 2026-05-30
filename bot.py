@@ -65,6 +65,8 @@ MAX_POSITION_USD   = float(os.getenv("MAX_POSITION_USD",    "50"))     # $ at ri
 MAX_CONTRACTS      = int(os.getenv("MAX_CONTRACTS",         "200"))    # hard cap per order
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS",    "5"))
 MAX_PORTFOLIO_PCT  = float(os.getenv("MAX_PORTFOLIO_PCT",   "0.10"))   # max % of balance to risk per session
+MAX_PER_ASSET      = int(os.getenv("MAX_PER_ASSET",         "1"))      # max positions per asset per session
+TREND_SKIP_PCT     = float(os.getenv("TREND_SKIP_PCT",      "0.015"))  # skip NO-above in up-trend / YES-above in down-trend
 SCAN_INTERVAL      = int(os.getenv("SCAN_INTERVAL_SECONDS", "60"))
 MIN_MINUTES        = float(os.getenv("MIN_MINUTES",         "60"))     # at least 1h to close
 MAX_MINUTES        = float(os.getenv("MAX_MINUTES",         "1500"))   # at most ~25h to close
@@ -190,6 +192,28 @@ def _parse_close_time(raw: dict) -> Optional[datetime]:
     return None
 
 
+# ─── Kelly position sizing ───────────────────────────────────────────────────────
+
+def kelly_contracts(edge: float, price: float, balance: float) -> int:
+    """
+    Quarter-Kelly position size for a binary bet.
+
+    Full Kelly = edge / (1 − price)   ← fraction of bankroll to bet
+    We use ¼-Kelly for safety, then cap at MAX_POSITION_USD and floor at $2.
+
+    Example: edge=20%, price=10¢, balance=$275
+      full_kelly = 0.20 / 0.90 = 22.2%
+      quarter    = 5.6%  → $15.40
+      cap to $10 → 100 contracts
+    """
+    if price <= 0 or price >= 1 or edge <= 0:
+        return max(1, min(int(MAX_POSITION_USD / max(price, 0.01)), MAX_CONTRACTS))
+    full_kelly    = edge / (1.0 - price)
+    quarter_kelly = full_kelly / 4.0
+    usd           = max(2.0, min(balance * quarter_kelly, MAX_POSITION_USD))
+    return max(1, min(int(usd / price), MAX_CONTRACTS))
+
+
 # ─── Bot ─────────────────────────────────────────────────────────────────────────
 
 class WhaleCryptoBot:
@@ -307,20 +331,75 @@ class WhaleCryptoBot:
 
     def _find_signals(self, rtis: dict[str, float]) -> list[Signal]:
         signals: list[Signal] = []
+        balance = (self._portfolio_limit / MAX_PORTFOLIO_PCT) if MAX_PORTFOLIO_PCT > 0 else 275.0
 
         for asset, spot in rtis.items():
             raw_markets = self._fetch_markets(asset)
             vol   = self.feed.get_annualized_vol(asset)
             drift = self.feed.get_recent_drift(asset)
 
-            in_window = 0
+            # ── Priority 1: Trend filter ─────────────────────────────────────
+            # Don't bet NO on "above" markets during a strong up-trend, and
+            # don't bet YES on "above" markets during a strong down-trend.
+            trend_6h = self.feed.get_return(asset, lookback_candles=24)
+            skip_no_above  = trend_6h >  TREND_SKIP_PCT   # up-trend  → don't short
+            skip_yes_above = trend_6h < -TREND_SKIP_PCT   # down-trend → don't go long
+            if skip_no_above:
+                logger.info(f"{asset} 6h trend +{trend_6h:.1%} → skipping NO-above bets (don't fight the trend)")
+            elif skip_yes_above:
+                logger.info(f"{asset} 6h trend {trend_6h:.1%} → skipping YES-above bets (don't fight the trend)")
+
+            # ── Parse all in-window markets first (needed for monotonicity) ──
+            in_window_markets: list[MarketInfo] = []
             for raw in raw_markets:
                 info = self._parse_market(raw, spot)
-                if not info:
-                    continue
-                in_window += 1
+                if info:
+                    in_window_markets.append(info)
 
-                # P(YES resolves) with drift-adjusted log-normal model
+            logger.info(f"{asset}: {len(raw_markets)} markets total, {len(in_window_markets)} in time window")
+
+            # ── Priority 4: Monotonicity check ───────────────────────────────
+            # For "above" markets at the same expiry, YES price must decrease
+            # as the strike increases. Violations signal a ghost/stale orderbook.
+            # Build a set of tickers that pass the check.
+            valid_tickers: set[str] = set()
+            by_expiry: dict[str, list[MarketInfo]] = {}
+            for info in in_window_markets:
+                key = f"{info.close_time.date()}_{info.above}"
+                by_expiry.setdefault(key, []).append(info)
+
+            for group in by_expiry.values():
+                above_group = [m for m in group if m.above]
+                above_group.sort(key=lambda m: m.threshold)
+                monotonic = True
+                for i in range(1, len(above_group)):
+                    prev, curr = above_group[i - 1], above_group[i]
+                    # Higher strike must have lower or equal YES mid
+                    if curr.yes_mid > prev.yes_mid + 0.02:   # 2¢ tolerance for spread noise
+                        logger.info(
+                            f"Monotonicity violation: {prev.ticker} ({prev.yes_mid:.0%}) < "
+                            f"{curr.ticker} ({curr.yes_mid:.0%}) — skipping both"
+                        )
+                        monotonic = False
+                        # Mark both the violating pair as invalid
+                        valid_tickers.discard(prev.ticker)
+                        valid_tickers.discard(curr.ticker)
+                    elif monotonic:
+                        valid_tickers.add(prev.ticker)
+                        valid_tickers.add(curr.ticker)
+                # Single-market groups are always valid
+                if len(above_group) == 1:
+                    valid_tickers.add(above_group[0].ticker)
+                # Below-direction markets aren't monotonicity-checked (rare)
+                for m in group:
+                    if not m.above:
+                        valid_tickers.add(m.ticker)
+
+            # ── Generate signals ─────────────────────────────────────────────
+            for info in in_window_markets:
+                if info.ticker not in valid_tickers:
+                    continue
+
                 p_yes = fair_prob_above(spot, info.threshold, info.minutes_left, vol, drift)
                 if not info.above:
                     p_yes = 1.0 - p_yes
@@ -329,25 +408,23 @@ class WhaleCryptoBot:
                 if abs(p_yes - info.yes_mid) > MAX_DIVERGENCE:
                     logger.debug(
                         f"Skip {info.ticker}: model={p_yes:.0%} mid={info.yes_mid:.0%} "
-                        f"(divergence {abs(p_yes-info.yes_mid):.0%} > {MAX_DIVERGENCE:.0%})"
+                        f"divergence={abs(p_yes-info.yes_mid):.0%}"
                     )
                     continue
 
-                # YES leg
-                if 0.02 < info.yes_ask < 0.98:
+                # YES leg — skip if down-trend
+                if not skip_yes_above and 0.02 < info.yes_ask < 0.98:
                     edge = p_yes - info.yes_ask - KALSHI_FEE
                     if edge >= EDGE_THRESHOLD:
-                        n = max(1, min(int(MAX_POSITION_USD / info.yes_ask), MAX_CONTRACTS))
+                        n = kelly_contracts(edge, info.yes_ask, balance)
                         signals.append(Signal(info, "yes", p_yes, info.yes_ask, edge, n, n * edge))
 
-                # NO leg
-                if 0.02 < info.no_ask < 0.98:
+                # NO leg — skip if up-trend
+                if not skip_no_above and 0.02 < info.no_ask < 0.98:
                     edge = (1.0 - p_yes) - info.no_ask - KALSHI_FEE
                     if edge >= EDGE_THRESHOLD:
-                        n = max(1, min(int(MAX_POSITION_USD / info.no_ask), MAX_CONTRACTS))
+                        n = kelly_contracts(edge, info.no_ask, balance)
                         signals.append(Signal(info, "no", p_yes, info.no_ask, edge, n, n * edge))
-
-            logger.info(f"{asset}: {len(raw_markets)} markets total, {in_window} in time window")
 
         signals.sort(key=lambda s: s.edge, reverse=True)
         return signals
@@ -461,6 +538,16 @@ class WhaleCryptoBot:
                 continue
             if opposite_key in self._placed:
                 logger.info(f"  Skip {sig.market.ticker} {sig.side.upper()} — opposite side already traded (avoid wash)")
+                continue
+
+            # Priority 2: per-asset position limit — prevents 3× correlated BTC bets
+            series_prefix  = CRYPTO_SERIES.get(sig.market.asset, "")
+            asset_placed   = sum(1 for k in self._placed if k.startswith(series_prefix))
+            if asset_placed >= MAX_PER_ASSET:
+                logger.info(
+                    f"  Skip {sig.market.ticker} {sig.side.upper()} — "
+                    f"already have {asset_placed} {sig.market.asset} position(s) this session"
+                )
                 continue
 
             # Portfolio budget guard

@@ -230,6 +230,31 @@ class CFBenchmarkFeed:
             logger.debug(f"Drift fetch failed for {asset}: {e}")
             return 0.0
 
+    # ── Trend ────────────────────────────────────────────────────────────────────
+
+    def get_return(self, asset: str, lookback_candles: int = 24) -> float:
+        """
+        Simple price return over the last `lookback_candles` × 15-min periods.
+        Default = 24 candles = 6 hours.  Positive = up, negative = down.
+        Returns 0.0 on any error so callers get a safe neutral default.
+        """
+        asset = asset.upper()
+        pair  = COINBASE_PAIRS.get(asset)
+        if not pair:
+            return 0.0
+        try:
+            resp = self.client.get(
+                COINBASE_CANDLES.format(pair=pair),
+                params={"granularity": 900},
+            )
+            resp.raise_for_status()
+            closes = [float(c[4]) for c in resp.json()[:lookback_candles + 1]]
+            if len(closes) < 2:
+                return 0.0
+            return (closes[0] - closes[-1]) / closes[-1]
+        except Exception:
+            return 0.0
+
     @staticmethod
     def _fallback_vol(asset: str) -> float:
         return FALLBACK_VOLS.get(asset.upper(), 1.00)
