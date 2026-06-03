@@ -64,8 +64,11 @@ def get_kalshi() -> KalshiClient | None:
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _bot_running() -> bool:
-    r = subprocess.run(["pgrep", "-f", "bot.py"], capture_output=True)
-    return r.returncode == 0
+    try:
+        r = subprocess.run(["pgrep", "-f", "bot.py"], capture_output=True)
+        return r.returncode == 0
+    except (FileNotFoundError, OSError):
+        return False  # pgrep not available (Railway)
 
 
 def _load_history() -> list[dict]:
