@@ -41,10 +41,20 @@ KALSHI_FEE = 0.007
 
 app = FastAPI(title="WhaleCrypto")
 
-kalshi = KalshiClient(
-    api_key_id=os.getenv("KALSHI_API_KEY_ID"),
-    private_key_path=os.getenv("KALSHI_PRIVATE_KEY_PATH"),
-)
+# Lazy Kalshi client — don't crash at startup if env vars aren't set yet
+_kalshi: KalshiClient | None = None
+
+def get_kalshi() -> KalshiClient | None:
+    global _kalshi
+    if _kalshi is None:
+        key_id   = os.getenv("KALSHI_API_KEY_ID")
+        key_path = os.getenv("KALSHI_PRIVATE_KEY_PATH")
+        if key_id and key_path:
+            try:
+                _kalshi = KalshiClient(api_key_id=key_id, private_key_path=key_path)
+            except Exception:
+                pass
+    return _kalshi
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -59,8 +69,11 @@ def _load_history() -> list[dict]:
 
 
 def _fetch_result(ticker: str) -> str | None:
+    k = get_kalshi()
+    if not k:
+        return None
     try:
-        market = kalshi.get_market(ticker)
+        market = k.get_market(ticker)
         result = market.get("result")
         return result if result in ("yes", "no") else None
     except Exception:
@@ -156,7 +169,8 @@ def _compute_pnl(history: list[dict]) -> dict:
 @app.get("/api/status")
 def api_status():
     try:
-        balance  = kalshi.get_balance()
+        k        = get_kalshi()
+        balance  = k.get_balance() if k else 0.0
         dry_run  = os.getenv("DRY_RUN", "true").lower() != "false"
         running  = _bot_running()
         history  = _load_history()
@@ -169,6 +183,7 @@ def api_status():
             "live_trades": len(live),
             "dry_trades":  len(dry),
             "last_scan":   history[-1]["ts"][:19].replace("T", " ") if history else "—",
+            "credentials": k is not None,
         }
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
@@ -177,7 +192,10 @@ def api_status():
 @app.get("/api/orders")
 def api_orders():
     try:
-        data   = kalshi._get("/portfolio/orders", params={"limit": 20, "status": "resting"})
+        k = get_kalshi()
+        if not k:
+            return {"orders": [], "error": "credentials not configured"}
+        data   = k._get("/portfolio/orders", params={"limit": 20, "status": "resting"})
         orders = data.get("orders", [])
         out    = []
         for o in orders:
