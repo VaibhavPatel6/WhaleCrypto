@@ -429,7 +429,9 @@ function fmt(v, prefix='$') {
 }
 
 async function loadStatus() {
-  const d = await fetch('/api/status').then(r=>r.json());
+  let d;
+  try { d = await fetch('/api/status').then(r=>r.json()); }
+  catch(e) { document.getElementById('balance').textContent = 'API error'; return; }
   document.getElementById('balance').textContent = d.balance > 0 ? '$' + d.balance.toFixed(2) : '—';
   document.getElementById('live-trades').textContent = d.live_trades + ' live · ' + d.dry_trades + ' dry';
   document.getElementById('refresh-ts').textContent = 'Last scan: ' + (d.last_scan || '—');
@@ -464,7 +466,10 @@ async function loadStatus() {
 }
 
 async function loadPnl() {
-  const d = await fetch('/api/pnl').then(r=>r.json());
+  let d;
+  try { d = await fetch('/api/pnl').then(r=>r.json()); }
+  catch(e) { return; }
+  if (d.error) return;
 
   const pnlEl = document.getElementById('total-pnl');
   pnlEl.textContent = (d.total_pnl >= 0 ? '+$' : '-$') + Math.abs(d.total_pnl).toFixed(2);
@@ -519,34 +524,43 @@ async function loadPnl() {
 }
 
 async function loadOrders() {
-  const d = await fetch('/api/orders').then(r=>r.json());
-  const tb = document.getElementById('orders-body');
-  if (!d.orders || d.orders.length === 0) {
-    tb.innerHTML = '<tr><td colspan="5" class="empty">No open orders</td></tr>'; return;
+  try {
+    const d = await fetch('/api/orders').then(r=>r.json());
+    const tb = document.getElementById('orders-body');
+    if (d.error) { tb.innerHTML = `<tr><td colspan="5" class="empty" style="color:#f87171">${d.error}</td></tr>`; return; }
+    if (!d.orders || d.orders.length === 0) {
+      tb.innerHTML = '<tr><td colspan="5" class="empty">No open orders</td></tr>'; return;
+    }
+    tb.innerHTML = d.orders.map(o => `<tr>
+      <td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#9ca3af;font-size:12px">${o.ticker}</td>
+      <td><span class="tag ${o.side.toLowerCase()}">${o.side}</span></td>
+      <td>${o.contracts}</td>
+      <td>${o.price}¢</td>
+      <td style="color:#6b7280;font-size:12px">${o.placed}</td>
+    </tr>`).join('');
+  } catch(e) {
+    document.getElementById('orders-body').innerHTML = '<tr><td colspan="5" class="empty" style="color:#f87171">Connection error</td></tr>';
   }
-  tb.innerHTML = d.orders.map(o => `<tr>
-    <td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#9ca3af;font-size:12px">${o.ticker}</td>
-    <td><span class="tag ${o.side.toLowerCase()}">${o.side}</span></td>
-    <td>${o.contracts}</td>
-    <td>${o.price}¢</td>
-    <td style="color:#6b7280;font-size:12px">${o.placed}</td>
-  </tr>`).join('');
 }
 
 async function loadSignals() {
-  const d = await fetch('/api/signals').then(r=>r.json());
-  const tb = document.getElementById('signals-body');
-  if (!d.signals || d.signals.length === 0) {
-    tb.innerHTML = '<tr><td colspan="6" class="empty">No signals yet</td></tr>'; return;
+  try {
+    const d = await fetch('/api/signals').then(r=>r.json());
+    const tb = document.getElementById('signals-body');
+    if (!d.signals || d.signals.length === 0) {
+      tb.innerHTML = '<tr><td colspan="6" class="empty">No signals yet</td></tr>'; return;
+    }
+    tb.innerHTML = d.signals.map(s => `<tr>
+      <td style="color:#6b7280;font-size:12px">${s.ts}</td>
+      <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;color:#9ca3af">${s.ticker}</td>
+      <td><span class="tag ${s.side.toLowerCase()}">${s.side}</span></td>
+      <td>${s.price}¢</td>
+      <td style="color:#34d399">${s.edge}%</td>
+      <td><span class="tag ${s.dry_run ? 'dry' : 'live'}">${s.dry_run ? 'dry' : 'live'}</span></td>
+    </tr>`).join('');
+  } catch(e) {
+    document.getElementById('signals-body').innerHTML = '<tr><td colspan="6" class="empty" style="color:#f87171">Connection error</td></tr>';
   }
-  tb.innerHTML = d.signals.map(s => `<tr>
-    <td style="color:#6b7280;font-size:12px">${s.ts}</td>
-    <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;color:#9ca3af">${s.ticker}</td>
-    <td><span class="tag ${s.side.toLowerCase()}">${s.side}</span></td>
-    <td>${s.price}¢</td>
-    <td style="color:#34d399">${s.edge}%</td>
-    <td><span class="tag ${s.dry_run ? 'dry' : 'live'}">${s.dry_run ? 'dry' : 'live'}</span></td>
-  </tr>`).join('');
 }
 
 async function toggleBot() {
