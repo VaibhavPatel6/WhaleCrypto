@@ -611,14 +611,20 @@ class WhaleCryptoBot:
 def main():
     # ── Private key: file path (local) OR raw content env var (Railway) ──────
     import tempfile
-    key_content = os.getenv("KALSHI_PRIVATE_KEY_CONTENT", "")
+    key_content  = os.getenv("KALSHI_PRIVATE_KEY_CONTENT", "")
+    key_path_env = os.getenv("KALSHI_PRIVATE_KEY_PATH", "")
+
+    # Also handle the common mistake of pasting key content into KALSHI_PRIVATE_KEY_PATH
+    if not key_content and key_path_env.strip().startswith("-----BEGIN"):
+        key_content = key_path_env
+
     if key_content:
         tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".pem", delete=False)
         tmp.write(key_content.replace("\\n", "\n"))
         tmp.close()
         private_key_path = tmp.name
     else:
-        private_key_path = os.getenv("KALSHI_PRIVATE_KEY_PATH", "./kalshi_private_key.pem")
+        private_key_path = key_path_env or "./kalshi_private_key.pem"
 
     dry_run    = os.getenv("DRY_RUN", "true").lower() != "false"
     api_key_id = os.getenv("KALSHI_API_KEY_ID")

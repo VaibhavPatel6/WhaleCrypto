@@ -24,8 +24,12 @@ from fastapi.responses import HTMLResponse, JSONResponse
 
 load_dotenv("env")
 
-# Private key: file path (local) OR raw content env var (Railway)
-_key_content = os.getenv("KALSHI_PRIVATE_KEY_CONTENT", "")
+# Private key: file path (local) OR raw content env var (Railway).
+# Also handles the common mistake of pasting key content into KALSHI_PRIVATE_KEY_PATH.
+_key_content  = os.getenv("KALSHI_PRIVATE_KEY_CONTENT", "")
+_key_path_env = os.getenv("KALSHI_PRIVATE_KEY_PATH", "")
+if not _key_content and _key_path_env.strip().startswith("-----BEGIN"):
+    _key_content = _key_path_env
 if _key_content:
     _tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".pem", delete=False)
     _tmp.write(_key_content.replace("\\n", "\n"))
