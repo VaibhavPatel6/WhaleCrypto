@@ -449,7 +449,7 @@ async function loadStatus() {
     btn.textContent = 'Managed by Railway';
     btn.className = 'btn start';
     btn.style.opacity = '0.5';
-    btn.onclick = () => alert('The bot runs as a Railway worker service and starts automatically.\nTo restart it, go to your Railway dashboard → worker service → Redeploy.');
+    btn.onclick = () => alert('The bot runs as a Railway worker service and starts automatically. To restart it, go to your Railway dashboard -> worker service -> Redeploy.');
     return;
   }
 
