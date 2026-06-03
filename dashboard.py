@@ -188,6 +188,7 @@ def api_status():
             "dry_trades":  len(dry),
             "last_scan":   history[-1]["ts"][:19].replace("T", " ") if history else "—",
             "credentials": k is not None,
+            "railway":     bool(os.getenv("RAILWAY_ENVIRONMENT")),
         }
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
@@ -249,12 +250,18 @@ def api_signals():
 
 @app.post("/api/bot/stop")
 def bot_stop():
+    # On Railway the bot is a separate worker service — cannot stop it from here.
+    if os.getenv("RAILWAY_ENVIRONMENT"):
+        return {"status": "railway", "msg": "Bot runs as a Railway worker service. Stop it from the Railway dashboard."}
     subprocess.run(["pkill", "-f", "python3 bot.py"])
     return {"status": "stopped"}
 
 
 @app.post("/api/bot/start")
 def bot_start():
+    # On Railway the bot is a separate worker service — cannot start it from here.
+    if os.getenv("RAILWAY_ENVIRONMENT"):
+        return {"status": "railway", "msg": "Bot runs as a Railway worker service and starts automatically. Manage it from the Railway dashboard."}
     subprocess.Popen(
         ["python3", "bot.py"],
         cwd=str(Path(__file__).parent),
@@ -423,12 +430,24 @@ function fmt(v, prefix='$') {
 
 async function loadStatus() {
   const d = await fetch('/api/status').then(r=>r.json());
-  document.getElementById('balance').textContent = '$' + d.balance.toFixed(2);
+  document.getElementById('balance').textContent = d.balance > 0 ? '$' + d.balance.toFixed(2) : '—';
   document.getElementById('live-trades').textContent = d.live_trades + ' live · ' + d.dry_trades + ' dry';
   document.getElementById('refresh-ts').textContent = 'Last scan: ' + (d.last_scan || '—');
 
   const badge = document.getElementById('bot-badge');
   const btn   = document.getElementById('toggle-btn');
+
+  // On Railway the worker runs independently — always show "Railway Worker" status
+  if (d.railway) {
+    badge.className = 'badge live';
+    badge.querySelector('span').textContent = 'Railway Worker';
+    btn.textContent = 'Managed by Railway';
+    btn.className = 'btn start';
+    btn.style.opacity = '0.5';
+    btn.onclick = () => alert('The bot runs as a Railway worker service and starts automatically.\nTo restart it, go to your Railway dashboard → worker service → Redeploy.');
+    return;
+  }
+
   if (d.running && !d.dry_run) {
     badge.className = 'badge live';
     badge.querySelector('span').textContent = 'Live';
