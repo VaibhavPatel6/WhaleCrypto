@@ -48,6 +48,7 @@ from dotenv import load_dotenv
 
 from kalshi_client import KalshiClient
 from price_feed import CFBenchmarkFeed
+import db
 
 load_dotenv("env")
 logging.basicConfig(
@@ -97,7 +98,7 @@ STRIKE_STEP: dict[str, float] = {
     "DOGE": 0.005,  # typical DOGE increment
 }
 
-HISTORY_FILE = Path("trade_history.json")
+# trade_history.json kept for local dev; db.py swaps it for Postgres on Railway
 
 
 # ─── Data models ─────────────────────────────────────────────────────────────────
@@ -231,37 +232,22 @@ class WhaleCryptoBot:
     # ── Persistence ──────────────────────────────────────────────────────────────
 
     def _load_history(self):
-        if HISTORY_FILE.exists():
-            try:
-                self.history = json.loads(HISTORY_FILE.read_text())
-                logger.info(f"Loaded {len(self.history)} past trades from {HISTORY_FILE}")
-                # Re-seed _placed so we don't re-enter positions that haven't expired yet.
-                # Use the recorded ts + minutes_left to compute expiry — no ticker parsing needed.
-                now = datetime.now(timezone.utc)
-                for rec in self.history:
-                    ticker       = rec.get("ticker", "")
-                    side         = rec.get("side", "")
-                    ts_str       = rec.get("ts", "")
-                    minutes_left = rec.get("minutes_left", 0)
-                    if not ts_str:
-                        continue
-                    try:
-                        placed_at = datetime.fromisoformat(ts_str)
-                        expiry    = placed_at + timedelta(minutes=minutes_left)
-                        if expiry > now:
-                            self._placed.add(f"{ticker}_{side}")
-                    except (ValueError, TypeError):
-                        pass
-                if self._placed:
-                    logger.info(f"Skipping {len(self._placed)} already-traded position(s) from prior run")
-            except Exception:
-                self.history = []
-
-    def _save_history(self):
         try:
-            HISTORY_FILE.write_text(json.dumps(self.history, indent=2))
+            self.history = db.load_trades()
+            logger.info(f"Loaded {len(self.history)} past trades")
+            db.seed_placed(self._placed)
+            if self._placed:
+                logger.info(f"Skipping {len(self._placed)} already-traded position(s) from prior run")
         except Exception as e:
-            logger.warning(f"Could not save history: {e}")
+            logger.warning(f"Could not load history: {e}")
+            self.history = []
+
+    def _save_trade(self, record: dict):
+        try:
+            db.save_trade(record)
+            self.history.append(record)
+        except Exception as e:
+            logger.warning(f"Could not save trade: {e}")
 
     # ── Market data ──────────────────────────────────────────────────────────────
 
@@ -499,8 +485,7 @@ class WhaleCryptoBot:
                 logger.error(f"Order failed for {sig.market.ticker}: {e}")
                 return False
 
-        self.history.append(record)
-        self._save_history()
+        self._save_trade(record)
         return True
 
     # ── Main loop ─────────────────────────────────────────────────────────────────
@@ -624,12 +609,26 @@ class WhaleCryptoBot:
 # ─── Entry point ─────────────────────────────────────────────────────────────────
 
 def main():
-    dry_run          = os.getenv("DRY_RUN", "true").lower() != "false"
-    api_key_id       = os.getenv("KALSHI_API_KEY_ID")
-    private_key_path = os.getenv("KALSHI_PRIVATE_KEY_PATH")
+    # ── Private key: file path (local) OR raw content env var (Railway) ──────
+    import tempfile
+    key_content = os.getenv("KALSHI_PRIVATE_KEY_CONTENT", "")
+    if key_content:
+        tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".pem", delete=False)
+        tmp.write(key_content.replace("\\n", "\n"))
+        tmp.close()
+        private_key_path = tmp.name
+    else:
+        private_key_path = os.getenv("KALSHI_PRIVATE_KEY_PATH", "./kalshi_private_key.pem")
 
-    if not api_key_id or not private_key_path:
-        raise SystemExit("Missing KALSHI_API_KEY_ID or KALSHI_PRIVATE_KEY_PATH in env file")
+    dry_run    = os.getenv("DRY_RUN", "true").lower() != "false"
+    api_key_id = os.getenv("KALSHI_API_KEY_ID")
+
+    if not api_key_id:
+        raise SystemExit("Missing KALSHI_API_KEY_ID in env")
+
+    # ── Database init + JSON migration ────────────────────────────────────────
+    db.init_db()
+    db.migrate_from_json()
 
     kalshi = KalshiClient(api_key_id=api_key_id, private_key_path=private_key_path)
     feed   = CFBenchmarkFeed()

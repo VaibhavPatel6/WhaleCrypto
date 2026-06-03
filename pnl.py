@@ -8,17 +8,15 @@ Usage:
   python3 pnl.py
 """
 
-import json
 import os
 import sys
-from pathlib import Path
 from dotenv import load_dotenv
 from kalshi_client import KalshiClient
+import db
 
 load_dotenv("env")
 
-KALSHI_FEE  = 0.007
-HISTORY_FILE = Path("trade_history.json")
+KALSHI_FEE = 0.007
 
 
 def fetch_result(kalshi: KalshiClient, ticker: str) -> str | None:
@@ -34,13 +32,9 @@ def fetch_result(kalshi: KalshiClient, ticker: str) -> str | None:
 
 
 def main():
-    if not HISTORY_FILE.exists():
-        print("No trade_history.json found — run the bot first.")
-        sys.exit(0)
-
-    history = json.loads(HISTORY_FILE.read_text())
+    history = db.load_trades()
     if not history:
-        print("Trade history is empty.")
+        print("No trade history found — run the bot first.")
         sys.exit(0)
 
     api_key_id       = os.getenv("KALSHI_API_KEY_ID")
