@@ -242,6 +242,28 @@ class WhaleCryptoBot:
             logger.warning(f"Could not load history: {e}")
             self.history = []
 
+    def _seed_from_open_orders(self):
+        """
+        Seed _placed from live Kalshi open orders on startup.
+        This prevents duplicates when the Railway worker restarts with an empty DB.
+        """
+        try:
+            data   = self.kalshi._get("/portfolio/orders",
+                                      params={"limit": 100, "status": "resting"})
+            orders = data.get("orders", [])
+            before = len(self._placed)
+            for o in orders:
+                ticker = o.get("ticker", "")
+                side   = o.get("side", "")
+                if ticker and side:
+                    self._placed.add(f"{ticker}_{side}")
+                    # Also block the asset (BTC/ETH/XRP) to enforce MAX_PER_ASSET
+            added = len(self._placed) - before
+            if added:
+                logger.info(f"Seeded {added} open order(s) from Kalshi into dedup set")
+        except Exception as e:
+            logger.warning(f"Could not seed from open orders: {e}")
+
     def _save_trade(self, record: dict):
         try:
             db.save_trade(record)
@@ -589,6 +611,10 @@ class WhaleCryptoBot:
         logger.info(f"  Time window  : {MIN_MINUTES:.0f}–{MAX_MINUTES:.0f} min to close")
         logger.info(f"  Scan every   : {SCAN_INTERVAL}s")
         logger.info("=" * 64)
+
+        # Seed dedup set from live Kalshi open orders (critical on Railway where DB starts empty)
+        if not self.dry_run:
+            self._seed_from_open_orders()
 
         try:
             while True:
