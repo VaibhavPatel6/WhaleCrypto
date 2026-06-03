@@ -4,6 +4,7 @@ Docs: https://trading-api.kalshi.com/trade-api/v2
 Auth: RSA private key signing (recommended) or email/password
 """
 
+import re
 import time
 import json
 import base64
@@ -68,10 +69,12 @@ class KalshiClient:
             )
 
     def _sign_request(self, method: str, path: str, body: str = "") -> dict:
-        """Generate RSA signature headers for Kalshi API."""
+        """Generate RSA signature headers for Kalshi API.
+        Kalshi signs: timestamp_ms + METHOD + full_path  (body excluded).
+        """
         timestamp_ms = str(int(time.time() * 1000))
         full_path = "/trade-api/v2" + path
-        msg_string = timestamp_ms + method.upper() + full_path + body
+        msg_string = timestamp_ms + method.upper() + full_path
         signature = self.private_key.sign(
             msg_string.encode("utf-8"),
             PSS(mgf=MGF1(hashes.SHA256()), salt_length=PSS.MAX_LENGTH),
@@ -226,9 +229,11 @@ class KalshiClient:
         For a limit BUY NO at $0.38:
             side="no", action="buy", no_price=38
         """
+        # client_order_id: alphanumeric + dashes + underscores only — strip dots
+        safe_ticker = re.sub(r"[^A-Za-z0-9\-_]", "_", ticker)
         body = {
             "ticker": ticker,
-            "client_order_id": f"arb_{ticker}_{int(time.time()*1000)}",
+            "client_order_id": f"arb_{safe_ticker}_{int(time.time()*1000)}",
             "type": order_type,
             "action": action,
             "side": side,

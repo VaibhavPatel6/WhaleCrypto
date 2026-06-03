@@ -85,14 +85,15 @@ CRYPTO_SERIES: dict[str, str] = {
     "LTC":  "KXLTC",
 }
 
-# Strike grid for each asset — Kalshi only lists real markets at these increments.
-# Anything in between is a ghost market with stale orders. Skip them.
-# XRP strikes end in .XX99500 with $0.02 spacing — checked via remainder ~0.00995.
+# Strike grid for each asset.
+# Kalshi changes increments as price levels shift — verified from live ticker data.
+# The check allows both exact multiples AND half-step offsets (e.g. BTC uses +50 offset).
+# Any strike not matching either pattern is a ghost market with a stale orderbook.
 STRIKE_STEP: dict[str, float] = {
-    "BTC":  250,    # $74,750 / $75,000 / $75,250 ...
-    "ETH":  40,     # $2,080 / $2,120 / $2,160 ...
-    "SOL":  1,      # $180 / $181 / $182 ...
-    "XRP":  0.02,   # $1.3099500 / $1.3299500 ... (offset ~0.00995 from round cents)
+    "BTC":  100,    # B70050 / B70150 / B70250 ... (+50 offset from round hundreds)
+    "ETH":  20,     # B1840 / B1860 / B1880 ...
+    "SOL":  1,      # $73 / $74 / $75 ...
+    "XRP":  0.02,   # $1.3099500 / $1.3299500 ... (~0.01 offset from round cents)
     "DOGE": 0.005,  # typical DOGE increment
 }
 
@@ -290,11 +291,16 @@ class WhaleCryptoBot:
             return None
         above, threshold = parsed
 
-        # Skip ghost markets sitting between real Kalshi strikes
+        # Skip ghost markets sitting between real Kalshi strikes.
+        # Allow both exact multiples (remainder=0) and half-step offsets (remainder=step/2)
+        # because Kalshi uses offset grids on some assets (e.g. BTC: 70050, 70150, 70250).
         step = STRIKE_STEP.get(asset)
-        if step and round(threshold % step, 6) != 0:
-            logger.debug(f"Skip {ticker}: ${threshold} not on ${step} grid (ghost market)")
-            return None
+        if step:
+            remainder = round(threshold % step, 6)
+            half      = round(step / 2, 6)
+            if remainder != 0 and abs(remainder - half) > 0.0001 and abs(remainder - step) > 0.001:
+                logger.debug(f"Skip {ticker}: ${threshold} not on ${step} grid (ghost market)")
+                return None
 
         # Skip deep OTM strikes — spreads are wide and model error dominates
         if abs(threshold - spot) / spot > MAX_OTM_PCT:
@@ -572,6 +578,7 @@ class WhaleCryptoBot:
                 self._placed.add(key)
                 self._session_exposure += sig.contracts * sig.price
                 executed += 1
+                time.sleep(2)   # avoid Kalshi rate limit between orders
 
     def run(self):
         mode = "DRY RUN — paper trading" if self.dry_run else "⚠ LIVE TRADING ⚠"
