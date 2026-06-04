@@ -227,6 +227,7 @@ class WhaleCryptoBot:
         self._placed: set[str] = set()      # "ticker_side" keys already traded this session
         self._session_exposure: float = 0.0  # total dollars committed this session
         self._portfolio_limit: float = float("inf")  # set from live balance in run()
+        self._session_date: str = datetime.now(timezone.utc).strftime("%Y-%m-%d")  # daily reset
         self._load_history()
 
     # ── Persistence ──────────────────────────────────────────────────────────────
@@ -512,7 +513,27 @@ class WhaleCryptoBot:
 
     # ── Main loop ─────────────────────────────────────────────────────────────────
 
+    def _daily_reset(self):
+        """Reset session state at UTC midnight so the bot trades fresh each day."""
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if today != self._session_date:
+            logger.info(f"Daily reset: new UTC day {today} — clearing {len(self._placed)} placed positions")
+            self._placed.clear()
+            self._session_exposure = 0.0
+            self._session_date = today
+            # Re-seed from whatever is currently resting on Kalshi
+            if not self.dry_run:
+                self._seed_from_open_orders()
+            # Refresh portfolio limit with current balance
+            try:
+                balance = self.kalshi.get_balance()
+                self._portfolio_limit = balance * MAX_PORTFOLIO_PCT
+                logger.info(f"Daily reset: new portfolio cap ${self._portfolio_limit:.2f} (balance ${balance:.2f})")
+            except Exception:
+                pass
+
     def scan_once(self):
+        self._daily_reset()
         logger.info("─" * 64)
         try:
             rtis = self.feed.get_prices(list(CRYPTO_SERIES.keys()))
