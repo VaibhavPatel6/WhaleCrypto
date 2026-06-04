@@ -163,7 +163,16 @@ def fair_prob_above(
 # ─── Market parsing ───────────────────────────────────────────────────────────────
 
 def _parse_ticker(ticker: str) -> Optional[tuple[bool, float]]:
-    """Extract (above, threshold) from ticker like KXBTC-26MAY2417-B76625."""
+    """
+    Extract (above, threshold) from ticker like KXBTC-26MAY2417-B76625.
+
+    Range markets (e.g. KXETH-25MAY2417-R1730-T1769) must be excluded.
+    Their ticker ends with -T<num> just like a plain "below" binary market,
+    so we explicitly reject any ticker that contains the range indicator -R<num>.
+    """
+    # Kalshi range market tickers contain -R followed by digits (e.g. -R1730-T1769)
+    if re.search(r"-R\d", ticker):
+        return None
     m = re.search(r"-([BT])([\d.]+)$", ticker)
     if not m:
         return None
@@ -228,6 +237,13 @@ class WhaleCryptoBot:
         self._session_exposure: float = 0.0  # total dollars committed this session
         self._portfolio_limit: float = float("inf")  # set from live balance in run()
         self._session_date: str = datetime.now(timezone.utc).strftime("%Y-%m-%d")  # daily reset
+        # Circuit breaker state — reset daily
+        self._consecutive_losses: int = 0
+        self._circuit_breaker_half_size: bool = False
+        self._circuit_breaker_paused: bool = False
+        self._circuit_breaker_last_check: float = 0.0
+        # Outcome backfill — run once per hour
+        self._last_outcome_backfill: float = 0.0
         self._load_history()
 
     # ── Persistence ──────────────────────────────────────────────────────────────
@@ -344,9 +360,12 @@ class WhaleCryptoBot:
 
     # ── Signal generation ────────────────────────────────────────────────────────
 
-    def _find_signals(self, rtis: dict[str, float]) -> list[Signal]:
+    def _find_signals(self, rtis: dict[str, float], threshold: float = None) -> list[Signal]:
+        if threshold is None:
+            threshold = EDGE_THRESHOLD
         signals: list[Signal] = []
-        balance = (self._portfolio_limit / MAX_PORTFOLIO_PCT) if MAX_PORTFOLIO_PCT > 0 else 275.0
+        balance   = (self._portfolio_limit / MAX_PORTFOLIO_PCT) if MAX_PORTFOLIO_PCT > 0 else 275.0
+        size_mult = 0.5 if self._circuit_breaker_half_size else 1.0
 
         for asset, spot in rtis.items():
             raw_markets = self._fetch_markets(asset)
@@ -363,6 +382,18 @@ class WhaleCryptoBot:
                 logger.info(f"{asset} 6h trend +{trend_6h:.1%} → skipping NO-above bets (don't fight the trend)")
             elif skip_yes_above:
                 logger.info(f"{asset} 6h trend {trend_6h:.1%} → skipping YES-above bets (don't fight the trend)")
+
+            # ── Spot orderbook pressure ──────────────────────────────────────
+            # Bid/ask dollar-volume ratio from Coinbase: < 0.70 = heavy sell
+            # pressure, > 1.40 = heavy buy pressure.  Skip bets that swim
+            # against a pronounced imbalance.
+            pressure       = self.feed.get_orderbook_pressure(asset)
+            heavy_sell_prs = pressure < 0.70
+            heavy_buy_prs  = pressure > 1.40
+            if heavy_sell_prs:
+                logger.info(f"{asset} heavy sell pressure (ratio={pressure:.2f}) → skipping bullish bets")
+            elif heavy_buy_prs:
+                logger.info(f"{asset} heavy buy pressure (ratio={pressure:.2f}) → skipping bearish bets")
 
             # ── Parse all in-window markets first (needed for monotonicity) ──
             in_window_markets: list[MarketInfo] = []
@@ -427,18 +458,23 @@ class WhaleCryptoBot:
                     )
                     continue
 
-                # YES leg — skip if down-trend
-                if not skip_yes_above and 0.02 < info.yes_ask < 0.98:
+                # YES leg — bullish on "above" markets, bearish on "below" markets
+                # Block if trend filter fires, or if spot pressure opposes the bet
+                yes_bullish = info.above   # YES-above = bullish; YES-below = bearish
+                yes_vs_pressure = (yes_bullish and heavy_sell_prs) or (not yes_bullish and heavy_buy_prs)
+                if not skip_yes_above and not yes_vs_pressure and 0.02 < info.yes_ask < 0.98:
                     edge = p_yes - info.yes_ask - KALSHI_FEE
-                    if edge >= EDGE_THRESHOLD:
-                        n = kelly_contracts(edge, info.yes_ask, balance)
+                    if edge >= threshold:
+                        n = max(1, int(kelly_contracts(edge, info.yes_ask, balance) * size_mult))
                         signals.append(Signal(info, "yes", p_yes, info.yes_ask, edge, n, n * edge))
 
-                # NO leg — skip if up-trend
-                if not skip_no_above and 0.02 < info.no_ask < 0.98:
+                # NO leg — bearish on "above" markets, bullish on "below" markets
+                no_bearish = info.above    # NO-above = bearish; NO-below = bullish
+                no_vs_pressure = (no_bearish and heavy_buy_prs) or (not no_bearish and heavy_sell_prs)
+                if not skip_no_above and not no_vs_pressure and 0.02 < info.no_ask < 0.98:
                     edge = (1.0 - p_yes) - info.no_ask - KALSHI_FEE
-                    if edge >= EDGE_THRESHOLD:
-                        n = kelly_contracts(edge, info.no_ask, balance)
+                    if edge >= threshold:
+                        n = max(1, int(kelly_contracts(edge, info.no_ask, balance) * size_mult))
                         signals.append(Signal(info, "no", p_yes, info.no_ask, edge, n, n * edge))
 
         signals.sort(key=lambda s: s.edge, reverse=True)
@@ -521,6 +557,9 @@ class WhaleCryptoBot:
             self._placed.clear()
             self._session_exposure = 0.0
             self._session_date = today
+            self._consecutive_losses = 0
+            self._circuit_breaker_half_size = False
+            self._circuit_breaker_paused = False
             # Re-seed from whatever is currently resting on Kalshi
             if not self.dry_run:
                 self._seed_from_open_orders()
@@ -583,9 +622,159 @@ class WhaleCryptoBot:
                 except Exception as e:
                     logger.warning(f"Could not cancel {order_id}: {e}")
 
+    def _get_effective_threshold(self) -> float:
+        """
+        Raise edge requirement during US market hours (9am–5pm EDT / 13:00–21:00 UTC)
+        when Kalshi is most liquid and prices are most efficiently arbitraged away.
+        """
+        utc_hour = datetime.now(timezone.utc).hour
+        if 13 <= utc_hour < 21:
+            return max(EDGE_THRESHOLD, 0.15)
+        return EDGE_THRESHOLD
+
+    def _update_circuit_breaker(self):
+        """
+        Count consecutive settled losses from live trade history and update breaker state.
+        2 losses → half position size;  4 losses → pause trading for the rest of the day.
+        Runs at most every 5 minutes to avoid excess Kalshi API calls.
+        """
+        if self.dry_run:
+            return
+        if time.time() - self._circuit_breaker_last_check < 300:
+            return
+        self._circuit_breaker_last_check = time.time()
+
+        live_trades = sorted(
+            [t for t in self.history if not t.get("dry_run") and t.get("order_id")],
+            key=lambda t: t.get("ts", ""),
+            reverse=True,
+        )
+        if not live_trades:
+            return
+
+        consecutive = 0
+        for trade in live_trades[:6]:
+            ticker   = trade.get("ticker", "")
+            our_side = trade.get("side", "yes")
+            if not ticker:
+                continue
+            try:
+                market = self.kalshi.get_market(ticker)
+            except Exception:
+                continue
+            if market.get("status") != "settled":
+                continue
+            result = (market.get("result") or "").lower()
+            if not result:
+                continue
+            if result == our_side.lower():
+                break           # we won — streak is over
+            consecutive += 1
+
+        old = self._consecutive_losses
+        self._consecutive_losses      = consecutive
+        self._circuit_breaker_half_size = consecutive >= 2
+        self._circuit_breaker_paused    = consecutive >= 4
+
+        if consecutive != old:
+            if consecutive == 0:
+                logger.info("Circuit breaker: streak cleared — full position size restored")
+            elif consecutive >= 4:
+                logger.warning(f"⛔ Circuit breaker TRIPPED ({consecutive} consecutive losses) — pausing today")
+            elif consecutive >= 2:
+                logger.warning(f"⚠  Circuit breaker ({consecutive} consecutive losses) — reducing to half size")
+            else:
+                logger.info(f"Circuit breaker: {consecutive} consecutive loss(es) tracked")
+
+    def _backfill_outcomes(self):
+        """
+        For every trade with no outcome yet, check whether Kalshi has settled
+        the market.  If settled, write back outcome / result / settled_pnl so
+        the dashboard and circuit breaker can work from local data instead of
+        re-fetching from Kalshi on every request.
+
+        Includes dry-run trades so model calibration accumulates even in paper
+        trading mode.  Runs at most once per hour.
+        """
+        if time.time() - self._last_outcome_backfill < 3600:
+            return
+        self._last_outcome_backfill = time.time()
+
+        pending = [t for t in self.history if t.get("ticker") and not t.get("outcome")]
+        if not pending:
+            return
+
+        logger.info(f"Outcome backfill: checking {len(pending)} unsettled trade(s)")
+        updated = 0
+        for trade in pending:
+            ticker    = trade.get("ticker", "")
+            our_side  = trade.get("side", "yes")
+            order_id  = trade.get("order_id")       # None for dry-run
+            contracts = int(trade.get("contracts", 0))
+            price     = float(trade.get("price", 0.0))
+            ts        = trade.get("ts", "")
+            is_dry    = trade.get("dry_run", True)
+
+            try:
+                market = self.kalshi.get_market(ticker)
+            except Exception:
+                continue
+
+            if market.get("status") != "settled":
+                continue
+
+            result = (market.get("result") or "").lower()
+            if not result:
+                continue
+
+            # For live orders verify fill count; dry-run assumes filled
+            filled = contracts
+            if not is_dry and order_id:
+                try:
+                    order  = self.kalshi.get_order(order_id)
+                    filled = int(order.get("filled_count") or order.get("contracts_filled") or contracts)
+                except Exception:
+                    pass
+
+            if filled == 0 and not is_dry:
+                outcome     = "unfilled"
+                settled_pnl = 0.0
+            else:
+                won         = result == our_side.lower()
+                outcome     = "won" if won else "lost"
+                settled_pnl = round(filled * (1.0 - price) if won else -filled * price, 2)
+
+            try:
+                db.update_trade_outcome(ts, ticker, outcome, result, settled_pnl)
+                trade["outcome"]     = outcome
+                trade["result"]      = result
+                trade["settled_pnl"] = settled_pnl
+                updated += 1
+                tag = "[DRY] " if is_dry else ""
+                logger.info(
+                    f"{tag}Settled {ticker} {our_side.upper()} → {result.upper()} "
+                    f"({outcome}) filled={filled}  P&L=${settled_pnl:+.2f}"
+                )
+            except Exception as e:
+                logger.warning(f"Could not save outcome for {ticker} {ts}: {e}")
+
+        if updated:
+            logger.info(f"Outcome backfill: {updated} trade(s) resolved")
+
     def scan_once(self):
         self._daily_reset()
+        self._backfill_outcomes()        # write settled outcomes back to DB (hourly)
         self._cancel_stale_orders()      # prune orders drifted >20% from limit
+        self._update_circuit_breaker()
+        if self._circuit_breaker_paused:
+            logger.warning("⛔ Circuit breaker active — skipping scan (too many consecutive losses today)")
+            return
+
+        effective_threshold = self._get_effective_threshold()
+        utc_hour = datetime.now(timezone.utc).hour
+        if effective_threshold > EDGE_THRESHOLD:
+            logger.info(f"US hours (UTC {utc_hour:02d}:xx) — edge threshold raised to {effective_threshold:.0%}")
+
         logger.info("─" * 64)
         try:
             rtis = self.feed.get_prices(list(CRYPTO_SERIES.keys()))
@@ -594,7 +783,7 @@ class WhaleCryptoBot:
             return
 
         try:
-            signals = self._find_signals(rtis)
+            signals = self._find_signals(rtis, threshold=effective_threshold)
         except Exception as e:
             logger.error(f"Signal scan error: {e}", exc_info=True)
             return
@@ -677,7 +866,9 @@ class WhaleCryptoBot:
         logger.info(f"WhaleCrypto Bot  [{mode}]")
         logger.info(f"  Price source : CF Benchmark RTI (constituent-exchange median)")
         logger.info(f"  Assets       : {', '.join(CRYPTO_SERIES)}  ({len(CRYPTO_SERIES)} series)")
-        logger.info(f"  Edge thresh  : {EDGE_THRESHOLD:.0%}")
+        logger.info(f"  Edge thresh  : {EDGE_THRESHOLD:.0%} (raised to 15% during US hours 13–21 UTC)")
+        logger.info(f"  Circuit breaker: half-size after 2 losses, pause after 4 losses")
+        logger.info(f"  Pressure filter: skip bets vs heavy spot imbalance (ratio <0.70 or >1.40)")
         logger.info(f"  OTM filter   : ±{MAX_OTM_PCT:.0%} of RTI")
         logger.info(f"  Max position : ${MAX_POSITION_USD:.0f} per trade")
         logger.info(f"  Portfolio cap: {MAX_PORTFOLIO_PCT:.0%} of balance = {limit_str} (balance: {balance_str})")

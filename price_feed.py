@@ -89,8 +89,9 @@ COINBASE_CANDLES = "https://api.exchange.coinbase.com/products/{pair}/candles"
 class CFBenchmarkFeed:
     def __init__(self):
         self.client = httpx.Client(timeout=6.0, headers={"User-Agent": "WhaleCrypto/1.0"})
-        self._vol_cache:   dict[str, tuple[float, float]] = {}  # asset -> (vol, ts)
-        self._drift_cache: dict[str, tuple[float, float]] = {}  # asset -> (drift, ts)
+        self._vol_cache:      dict[str, tuple[float, float]] = {}  # asset -> (vol, ts)
+        self._drift_cache:    dict[str, tuple[float, float]] = {}  # asset -> (drift, ts)
+        self._pressure_cache: dict[str, tuple[float, float]] = {}  # asset -> (ratio, ts)
 
     # ── Spot price ───────────────────────────────────────────────────────────
 
@@ -254,6 +255,40 @@ class CFBenchmarkFeed:
             return (closes[0] - closes[-1]) / closes[-1]
         except Exception:
             return 0.0
+
+    # ── Spot orderbook pressure ──────────────────────────────────────────────
+
+    def get_orderbook_pressure(self, asset: str, depth: int = 10) -> float:
+        """
+        Coinbase spot orderbook bid/ask dollar-volume ratio.
+        > 1.0 → more buy pressure;  < 1.0 → more sell pressure.
+        Returns 1.0 (neutral) on any error.  Cached 2 min.
+        """
+        asset = asset.upper()
+        cached = self._pressure_cache.get(asset)
+        if cached and time.time() - cached[1] < 120:
+            return cached[0]
+
+        pair = COINBASE_PAIRS.get(asset)
+        if not pair:
+            return 1.0
+        try:
+            resp = self.client.get(
+                f"https://api.exchange.coinbase.com/products/{pair}/book",
+                params={"level": 2},
+                timeout=5.0,
+            )
+            resp.raise_for_status()
+            book = resp.json()
+            bid_vol = sum(float(p) * float(q) for p, q, _ in book.get("bids", [])[:depth])
+            ask_vol = sum(float(p) * float(q) for p, q, _ in book.get("asks", [])[:depth])
+            ratio = bid_vol / ask_vol if ask_vol > 0 else 1.0
+            self._pressure_cache[asset] = (ratio, time.time())
+            logger.debug(f"{asset} orderbook pressure (bid/ask vol): {ratio:.2f}")
+            return ratio
+        except Exception as e:
+            logger.debug(f"Orderbook pressure unavailable for {asset}: {e}")
+            return 1.0
 
     @staticmethod
     def _fallback_vol(asset: str) -> float:

@@ -75,37 +75,61 @@ def _load_history() -> list[dict]:
     return db.load_trades()
 
 
-def _fetch_result(ticker: str) -> str | None:
+def _fetch_result(ticker: str) -> tuple[str | None, str]:
+    """
+    Returns (result, status) where result is 'yes'/'no'/None
+    and status is the raw Kalshi market status string.
+    """
     k = get_kalshi()
     if not k:
-        return None
+        return None, "unknown"
     try:
         market = k.get_market(ticker)
+        status = market.get("status", "unknown")
         result = market.get("result")
-        return result if result in ("yes", "no") else None
+        if result in ("yes", "no"):
+            return result, status
+        return None, status
     except Exception:
-        return None
+        return None, "unknown"
 
 
 def _compute_pnl(history: list[dict]) -> dict:
-    result_cache: dict[str, str | None] = {}
+    result_cache: dict[str, tuple] = {}   # ticker → (result, status)
     settled, pending = [], []
+    dry_settled = []   # dry-run trades with stored outcomes (calibration only)
 
     for rec in history:
-        if rec.get("dry_run"):
-            continue          # skip dry-run entries from analysis
         ticker = rec["ticker"]
-        if ticker not in result_cache:
-            result_cache[ticker] = _fetch_result(ticker)
+        is_dry = rec.get("dry_run", False)
 
-        market_result = result_cache[ticker]
+        # Use pre-stored outcome when available (avoids a Kalshi API call per trade)
+        if rec.get("outcome") and rec.get("result"):
+            market_result = rec["result"]
+            mkt_status    = "settled"
+        else:
+            if is_dry:
+                continue   # dry-run with no outcome yet — skip
+            if ticker not in result_cache:
+                result_cache[ticker] = _fetch_result(ticker)
+            market_result, mkt_status = result_cache[ticker]
+
         if market_result is None:
-            pending.append(rec)
+            if not is_dry:
+                # Show expired-but-unresolved trades as pending so they're visible
+                pending.append({**rec, "market_status": mkt_status})
             continue
 
-        won  = (market_result == rec["side"])
-        pnl  = (rec["contracts"] * (1.0 - rec["price"]) - rec["contracts"] * KALSHI_FEE
-                if won else -rec["contracts"] * rec["price"])
+        won = (market_result == rec["side"])
+
+        if is_dry:
+            # Dry-run: contribute to calibration but not P&L
+            dry_settled.append({**rec, "won": won, "pnl": 0.0,
+                                 "market_result": market_result})
+            continue
+
+        pnl = (rec["contracts"] * (1.0 - rec["price"]) - rec["contracts"] * KALSHI_FEE
+               if won else -rec["contracts"] * rec["price"])
         settled.append({**rec, "won": won, "pnl": round(pnl, 2),
                         "market_result": market_result})
 
@@ -116,15 +140,18 @@ def _compute_pnl(history: list[dict]) -> dict:
     roi         = (total_pnl / total_spent * 100) if total_spent else 0
 
     # Calibration: bucket trades by fair_prob, compute win rate per bucket
+    # Include dry-run trades (they have stored outcomes) for a larger sample.
     buckets: dict[str, dict] = {}
-    for t in settled:
-        fp  = t.get("fair_prob", 0.5)
-        # fair_prob is P(YES); for NO bets P(win) = 1 - fair_prob
+    for t in settled + dry_settled:
+        fp    = t.get("fair_prob", 0.5)
         p_win = fp if t["side"] == "yes" else 1 - fp
         b     = f"{int(p_win * 10) * 10}-{int(p_win * 10) * 10 + 10}%"
         if b not in buckets:
-            buckets[b] = {"predicted": round(p_win * 100, 1), "wins": 0, "total": 0}
+            buckets[b] = {"predicted": round(p_win * 100, 1), "wins": 0, "total": 0,
+                          "dry_total": 0}
         buckets[b]["total"] += 1
+        if t.get("dry_run"):
+            buckets[b]["dry_total"] += 1
         if t["won"]:
             buckets[b]["wins"] += 1
 
@@ -155,19 +182,20 @@ def _compute_pnl(history: list[dict]) -> dict:
         avg_return = round(sum(returns) / len(returns) * 100, 1)
 
     return {
-        "settled":    len(settled),
-        "pending":    len(pending),
-        "wins":       len(wins),
-        "losses":     len(losses),
-        "win_rate":   round(len(wins) / len(settled) * 100, 1) if settled else 0,
-        "total_spent": round(total_spent, 2),
-        "total_pnl":  round(total_pnl, 2),
-        "roi":        round(roi, 1),
-        "avg_edge":   avg_edge,
-        "avg_return": avg_return,
-        "calibration": buckets,
-        "cumulative": cumulative,
-        "trades":     sorted_settled[-20:],  # last 20 settled
+        "settled":      len(settled),
+        "pending":      len(pending),
+        "dry_settled":  len(dry_settled),   # paper trades with outcomes (calibration only)
+        "wins":         len(wins),
+        "losses":       len(losses),
+        "win_rate":     round(len(wins) / len(settled) * 100, 1) if settled else 0,
+        "total_spent":  round(total_spent, 2),
+        "total_pnl":    round(total_pnl, 2),
+        "roi":          round(roi, 1),
+        "avg_edge":     avg_edge,
+        "avg_return":   avg_return,
+        "calibration":  buckets,
+        "cumulative":   cumulative,
+        "trades":       sorted_settled[-20:],  # last 20 settled
     }
 
 

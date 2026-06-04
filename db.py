@@ -48,6 +48,13 @@ if DATABASE_URL:
                         order_id     TEXT
                     )
                 """)
+                # Outcome columns — added after initial schema; idempotent on existing tables
+                for col_def in [
+                    "outcome     TEXT",      # 'won', 'lost', 'unfilled'
+                    "result      TEXT",      # 'yes' or 'no' (what Kalshi settled)
+                    "settled_pnl REAL",      # actual dollars won or lost
+                ]:
+                    cur.execute(f"ALTER TABLE trades ADD COLUMN IF NOT EXISTS {col_def}")
             conn.commit()
 
     def load_trades() -> list[dict]:
@@ -70,6 +77,21 @@ if DATABASE_URL:
                          %(side)s, %(contracts)s, %(price)s, %(fair_prob)s, %(edge)s,
                          %(minutes_left)s, %(dry_run)s, %(order_id)s)
                 """, record)
+            conn.commit()
+
+    def update_trade_outcome(ts: str, ticker: str, outcome: str, result: str, settled_pnl: float):
+        """Write back the settlement outcome for a trade identified by (ts, ticker)."""
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE trades
+                       SET outcome=%(outcome)s, result=%(result)s, settled_pnl=%(settled_pnl)s
+                     WHERE ts=%(ts)s AND ticker=%(ticker)s
+                    """,
+                    {"ts": ts, "ticker": ticker, "outcome": outcome,
+                     "result": result, "settled_pnl": settled_pnl},
+                )
             conn.commit()
 
     def migrate_from_json():
@@ -112,6 +134,16 @@ else:
             HISTORY_FILE.write_text(json.dumps(trades, indent=2))
         except Exception as e:
             print(f"[db] Could not save trade: {e}")
+
+    def update_trade_outcome(ts: str, ticker: str, outcome: str, result: str, settled_pnl: float):
+        trades = load_trades()
+        for t in trades:
+            if t.get("ts") == ts and t.get("ticker") == ticker:
+                t["outcome"]     = outcome
+                t["result"]      = result
+                t["settled_pnl"] = settled_pnl
+                break
+        HISTORY_FILE.write_text(json.dumps(trades, indent=2))
 
     def migrate_from_json():
         pass  # already IS the JSON
