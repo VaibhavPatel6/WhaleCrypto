@@ -307,6 +307,20 @@ class WhaleCryptoBot:
         if not asset:
             return None
 
+        # ── Layer 1: reject non-binary market types ──────────────────────────
+        # Kalshi exposes a market_type field; we only want plain binary markets.
+        market_type = (raw.get("market_type") or raw.get("category") or "").lower()
+        if market_type and market_type not in ("binary", ""):
+            logger.debug(f"Skip {ticker}: non-binary market_type='{market_type}'")
+            return None
+
+        # ── Layer 2: reject range/bracket markets by title keyword ───────────
+        # Range market titles always contain "range" or "between".
+        # This is the most reliable signal and catches all known Kalshi range market formats.
+        if re.search(r"\b(range|between|bracket)\b", title, re.IGNORECASE):
+            logger.debug(f"Skip {ticker}: range market (title='{title[:60]}')")
+            return None
+
         close_time = _parse_close_time(raw)
         if not close_time:
             return None
