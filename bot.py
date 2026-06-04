@@ -532,8 +532,60 @@ class WhaleCryptoBot:
             except Exception:
                 pass
 
+    def _cancel_stale_orders(self, stale_drift: float = 0.20):
+        """
+        Cancel resting orders whose market price has drifted more than stale_drift
+        from the limit price. Frees capital and removes stale dedup entries.
+        """
+        if self.dry_run:
+            return
+        try:
+            data   = self.kalshi._get("/portfolio/orders",
+                                      params={"limit": 100, "status": "resting"})
+            orders = data.get("orders", [])
+        except Exception as e:
+            logger.warning(f"Could not fetch resting orders for staleness check: {e}")
+            return
+
+        for o in orders:
+            ticker   = o.get("ticker", "")
+            side     = o.get("side", "")   # "yes" or "no"
+            order_id = o.get("order_id", "")
+
+            # Get the limit price (what we paid)
+            if side == "yes":
+                limit = float(o.get("yes_price_dollars") or o.get("yes_price", 0) / 100)
+            else:
+                limit = float(o.get("no_price_dollars") or o.get("no_price", 0) / 100)
+
+            if not limit or not order_id:
+                continue
+
+            # Get current market price for the same side
+            try:
+                prices = self.kalshi.get_best_prices(ticker)
+                current = prices.get(f"{side}_ask") or prices.get(f"{side}_bid")
+                if current is None:
+                    continue
+            except Exception:
+                continue
+
+            drift = abs(current - limit)
+            if drift > stale_drift:
+                logger.info(
+                    f"Cancelling stale {side.upper()} order on {ticker}: "
+                    f"limit={limit:.0%} current={current:.0%} drift={drift:.0%}"
+                )
+                try:
+                    self.kalshi.cancel_order(order_id)
+                    # Free the dedup slot so the bot can re-evaluate
+                    self._placed.discard(f"{ticker}_{side}")
+                except Exception as e:
+                    logger.warning(f"Could not cancel {order_id}: {e}")
+
     def scan_once(self):
         self._daily_reset()
+        self._cancel_stale_orders()      # prune orders drifted >20% from limit
         logger.info("─" * 64)
         try:
             rtis = self.feed.get_prices(list(CRYPTO_SERIES.keys()))
