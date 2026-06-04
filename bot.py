@@ -130,6 +130,10 @@ class Signal:
     edge: float           # fair_EV minus price minus fee
     contracts: int
     expected_profit: float
+    # Model inputs at placement time — stored for post-hoc calibration analysis
+    vol_used:          float = 0.0   # annualized realized vol fed to BS model
+    drift_used:        float = 0.0   # annualized drift (momentum) fed to BS model
+    spot_at_placement: float = 0.0   # RTI price when the order was placed
 
 
 # ─── Math ────────────────────────────────────────────────────────────────────────
@@ -360,15 +364,18 @@ class WhaleCryptoBot:
 
     # ── Signal generation ────────────────────────────────────────────────────────
 
-    def _find_signals(self, rtis: dict[str, float], threshold: float = None) -> list[Signal]:
+    def _find_signals(self, rtis: dict[str, float], threshold: float = None) -> tuple[list[Signal], int]:
+        """Returns (signals, total_markets_scanned) for funnel diagnostics."""
         if threshold is None:
             threshold = EDGE_THRESHOLD
         signals: list[Signal] = []
-        balance   = (self._portfolio_limit / MAX_PORTFOLIO_PCT) if MAX_PORTFOLIO_PCT > 0 else 275.0
-        size_mult = 0.5 if self._circuit_breaker_half_size else 1.0
+        balance        = (self._portfolio_limit / MAX_PORTFOLIO_PCT) if MAX_PORTFOLIO_PCT > 0 else 275.0
+        size_mult      = 0.5 if self._circuit_breaker_half_size else 1.0
+        total_markets  = 0
 
         for asset, spot in rtis.items():
-            raw_markets = self._fetch_markets(asset)
+            raw_markets    = self._fetch_markets(asset)
+            total_markets += len(raw_markets)
             vol   = self.feed.get_annualized_vol(asset)
             drift = self.feed.get_recent_drift(asset)
 
@@ -466,7 +473,8 @@ class WhaleCryptoBot:
                     edge = p_yes - info.yes_ask - KALSHI_FEE
                     if edge >= threshold:
                         n = max(1, int(kelly_contracts(edge, info.yes_ask, balance) * size_mult))
-                        signals.append(Signal(info, "yes", p_yes, info.yes_ask, edge, n, n * edge))
+                        signals.append(Signal(info, "yes", p_yes, info.yes_ask, edge, n, n * edge,
+                                              vol_used=vol, drift_used=drift, spot_at_placement=spot))
 
                 # NO leg — bearish on "above" markets, bullish on "below" markets
                 no_bearish = info.above    # NO-above = bearish; NO-below = bullish
@@ -475,10 +483,11 @@ class WhaleCryptoBot:
                     edge = (1.0 - p_yes) - info.no_ask - KALSHI_FEE
                     if edge >= threshold:
                         n = max(1, int(kelly_contracts(edge, info.no_ask, balance) * size_mult))
-                        signals.append(Signal(info, "no", p_yes, info.no_ask, edge, n, n * edge))
+                        signals.append(Signal(info, "no", p_yes, info.no_ask, edge, n, n * edge,
+                                              vol_used=vol, drift_used=drift, spot_at_placement=spot))
 
         signals.sort(key=lambda s: s.edge, reverse=True)
-        return signals
+        return signals, total_markets
 
     # ── Notifications ────────────────────────────────────────────────────────────
 
@@ -512,19 +521,23 @@ class WhaleCryptoBot:
         )
 
         record: dict = {
-            "ts":       datetime.now(timezone.utc).isoformat(),
-            "ticker":   sig.market.ticker,
-            "asset":    sig.market.asset,
-            "threshold": sig.market.threshold,
-            "above":    sig.market.above,
-            "side":     sig.side,
-            "contracts": sig.contracts,
-            "price":    sig.price,
-            "fair_prob": round(sig.fair_prob, 4),
-            "edge":     round(sig.edge, 4),
-            "minutes_left": round(sig.market.minutes_left, 1),
-            "dry_run":  self.dry_run,
-            "order_id": None,
+            "ts":                datetime.now(timezone.utc).isoformat(),
+            "ticker":            sig.market.ticker,
+            "asset":             sig.market.asset,
+            "threshold":         sig.market.threshold,
+            "above":             sig.market.above,
+            "side":              sig.side,
+            "contracts":         sig.contracts,
+            "price":             sig.price,
+            "fair_prob":         round(sig.fair_prob, 4),
+            "edge":              round(sig.edge, 4),
+            "minutes_left":      round(sig.market.minutes_left, 1),
+            "dry_run":           self.dry_run,
+            "order_id":          None,
+            # Model inputs — stored for post-hoc calibration and vol accuracy analysis
+            "vol_used":          round(sig.vol_used, 4),
+            "drift_used":        round(sig.drift_used, 4),
+            "spot_at_placement": round(sig.spot_at_placement, 2),
         }
 
         if not self.dry_run:
@@ -783,11 +796,12 @@ class WhaleCryptoBot:
             return
 
         try:
-            signals = self._find_signals(rtis, threshold=effective_threshold)
+            signals, markets_scanned = self._find_signals(rtis, threshold=effective_threshold)
         except Exception as e:
             logger.error(f"Signal scan error: {e}", exc_info=True)
             return
 
+        logger.info(f"Funnel: {markets_scanned} markets → {len(signals)} signal(s) above {effective_threshold:.0%} threshold")
         if not signals:
             logger.info("No signals above threshold this scan")
             return
@@ -848,6 +862,9 @@ class WhaleCryptoBot:
                 self._session_exposure += sig.contracts * sig.price
                 executed += 1
                 time.sleep(2)   # avoid Kalshi rate limit between orders
+
+        if executed:
+            logger.info(f"Funnel: {executed} order(s) placed this scan | session exposure ${self._session_exposure:.2f}")
 
     def run(self):
         mode = "DRY RUN — paper trading" if self.dry_run else "⚠ LIVE TRADING ⚠"

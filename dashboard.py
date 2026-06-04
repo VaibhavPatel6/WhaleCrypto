@@ -181,21 +181,78 @@ def _compute_pnl(history: list[dict]) -> dict:
         avg_edge   = round(sum(edges) / len(edges) * 100, 1)
         avg_return = round(sum(returns) / len(returns) * 100, 1)
 
+    # ── Fill rate ────────────────────────────────────────────────────────────
+    all_live = [t for t in history if not t.get("dry_run")]
+    with_outcome = [t for t in all_live if t.get("outcome")]
+    filled   = [t for t in with_outcome if t["outcome"] in ("won", "lost")]
+    unfilled = [t for t in with_outcome if t["outcome"] == "unfilled"]
+    fill_rate = round(len(filled) / len(with_outcome) * 100, 1) if with_outcome else None
+
+    # ── Per-asset breakdown ───────────────────────────────────────────────────
+    per_asset: dict[str, dict] = {}
+    for t in settled:
+        a = t.get("asset", "?")
+        if a not in per_asset:
+            per_asset[a] = {"trades": 0, "wins": 0, "losses": 0, "pnl": 0.0}
+        per_asset[a]["trades"] += 1
+        per_asset[a]["pnl"]     = round(per_asset[a]["pnl"] + t["pnl"], 2)
+        if t["won"]:
+            per_asset[a]["wins"]   += 1
+        else:
+            per_asset[a]["losses"] += 1
+    for d in per_asset.values():
+        d["win_rate"] = round(d["wins"] / d["trades"] * 100, 1) if d["trades"] else 0
+
+    # ── Edge quartile win rates ───────────────────────────────────────────────
+    eq: dict[str, dict] = {}
+    EDGE_BUCKETS = [("12–15%", 0.12, 0.15), ("15–20%", 0.15, 0.20),
+                    ("20–30%", 0.20, 0.30), ("30%+",   0.30, 1.00)]
+    for label, lo, hi in EDGE_BUCKETS:
+        eq[label] = {"trades": 0, "wins": 0, "total_pnl": 0.0}
+    for t in settled:
+        e = t.get("edge", 0)
+        for label, lo, hi in EDGE_BUCKETS:
+            if lo <= e < hi:
+                eq[label]["trades"]    += 1
+                eq[label]["total_pnl"] += t["pnl"]
+                if t["won"]:
+                    eq[label]["wins"]  += 1
+                break
+    edge_quartiles = {}
+    for label, d in eq.items():
+        if d["trades"] == 0:
+            continue
+        edge_quartiles[label] = {
+            "trades":   d["trades"],
+            "win_rate": round(d["wins"] / d["trades"] * 100, 1),
+            "avg_pnl":  round(d["total_pnl"] / d["trades"], 2),
+        }
+
+    # ── Avg vol used (model input health check) ───────────────────────────────
+    vols = [t["vol_used"] for t in history if t.get("vol_used") and not t.get("dry_run")]
+    avg_vol_used = round(sum(vols) / len(vols) * 100, 1) if vols else None
+
     return {
-        "settled":      len(settled),
-        "pending":      len(pending),
-        "dry_settled":  len(dry_settled),   # paper trades with outcomes (calibration only)
-        "wins":         len(wins),
-        "losses":       len(losses),
-        "win_rate":     round(len(wins) / len(settled) * 100, 1) if settled else 0,
-        "total_spent":  round(total_spent, 2),
-        "total_pnl":    round(total_pnl, 2),
-        "roi":          round(roi, 1),
-        "avg_edge":     avg_edge,
-        "avg_return":   avg_return,
-        "calibration":  buckets,
-        "cumulative":   cumulative,
-        "trades":       sorted_settled[-20:],  # last 20 settled
+        "settled":       len(settled),
+        "pending":       len(pending),
+        "dry_settled":   len(dry_settled),
+        "wins":          len(wins),
+        "losses":        len(losses),
+        "win_rate":      round(len(wins) / len(settled) * 100, 1) if settled else 0,
+        "total_spent":   round(total_spent, 2),
+        "total_pnl":     round(total_pnl, 2),
+        "roi":           round(roi, 1),
+        "avg_edge":      avg_edge,
+        "avg_return":    avg_return,
+        "fill_rate":     fill_rate,
+        "fill_count":    len(filled),
+        "unfill_count":  len(unfilled),
+        "per_asset":     per_asset,
+        "edge_quartiles": edge_quartiles,
+        "avg_vol_used":  avg_vol_used,
+        "calibration":   buckets,
+        "cumulative":    cumulative,
+        "trades":        sorted_settled[-20:],
     }
 
 
@@ -377,6 +434,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .empty { text-align: center; color: #4b5563; padding: 32px; }
 
   #refresh-ts { font-size: 11px; color: #4b5563; }
+
+  .badge-ok   { color: #34d399; }
+  .badge-warn { color: #fbbf24; }
+  .badge-bad  { color: #f87171; }
+
+  .eq-bar-wrap { width: 80px; background: #1f2937; border-radius: 3px; height: 6px; display:inline-block; vertical-align: middle; overflow: hidden; }
+  .eq-bar      { height: 100%; border-radius: 3px; }
 </style>
 </head>
 <body>
@@ -416,6 +480,30 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
   </div>
 
+  <!-- Diagnostic KPI row -->
+  <div class="grid-4" style="margin-bottom:24px">
+    <div class="card">
+      <h2>Fill Rate</h2>
+      <div class="value" id="fill-rate">—</div>
+      <div class="sub" id="fill-rate-sub">of placed orders filled</div>
+    </div>
+    <div class="card">
+      <h2>Pending Resolution</h2>
+      <div class="value" id="pending-count">—</div>
+      <div class="sub" id="dry-calib-sub">— dry-run calibration trades</div>
+    </div>
+    <div class="card">
+      <h2>Avg Vol (model input)</h2>
+      <div class="value" id="avg-vol">—</div>
+      <div class="sub">annualized realized vol used</div>
+    </div>
+    <div class="card">
+      <h2>Circuit Breaker</h2>
+      <div class="value" id="circuit-status">—</div>
+      <div class="sub" id="circuit-sub">consecutive settled losses</div>
+    </div>
+  </div>
+
   <!-- P&L chart + calibration -->
   <div class="grid-2">
     <div class="card card-body">
@@ -426,6 +514,24 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="card card-body">
       <h2>Model Calibration <span style="font-size:11px;color:#6b7280;font-weight:400">(predicted win rate vs actual)</span></h2>
       <div id="calib-rows"><div class="empty">No data yet — need 50+ settled trades</div></div>
+    </div>
+  </div>
+
+  <!-- Per-asset P&L + edge quartile -->
+  <div class="grid-2">
+    <div class="card card-body">
+      <h2>P&amp;L by Asset</h2>
+      <table>
+        <thead><tr><th>Asset</th><th>Trades</th><th>W / L</th><th>P&amp;L</th><th>Win %</th></tr></thead>
+        <tbody id="asset-body"><tr><td colspan="5" class="empty">No settled trades yet</td></tr></tbody>
+      </table>
+    </div>
+    <div class="card card-body">
+      <h2>Edge Quartile Performance <span style="font-size:11px;color:#6b7280;font-weight:400">higher edge → higher win rate?</span></h2>
+      <table>
+        <thead><tr><th>Edge bucket</th><th>Trades</th><th>Win %</th><th></th><th>Avg P&amp;L</th></tr></thead>
+        <tbody id="edge-body"><tr><td colspan="5" class="empty">No settled trades yet</td></tr></tbody>
+      </table>
     </div>
   </div>
 
@@ -529,6 +635,89 @@ async function loadPnl() {
     });
   } else {
     document.getElementById('pnl-empty').style.display = 'block';
+  }
+
+  // Diagnostic KPI row
+  const fr = d.fill_rate;
+  const frEl = document.getElementById('fill-rate');
+  if (fr !== null && fr !== undefined) {
+    frEl.textContent = fr + '%';
+    frEl.className = 'value ' + (fr >= 70 ? 'green' : fr >= 40 ? '' : 'red');
+    document.getElementById('fill-rate-sub').textContent =
+      d.fill_count + ' filled · ' + d.unfill_count + ' unfilled';
+  }
+  const pendEl = document.getElementById('pending-count');
+  pendEl.textContent = d.pending !== undefined ? d.pending : '—';
+  if (d.dry_settled !== undefined)
+    document.getElementById('dry-calib-sub').textContent = d.dry_settled + ' dry-run calibration trades';
+
+  const volEl = document.getElementById('avg-vol');
+  if (d.avg_vol_used !== null && d.avg_vol_used !== undefined) {
+    volEl.textContent = d.avg_vol_used + '%/yr';
+    const volOk = d.avg_vol_used >= 40 && d.avg_vol_used <= 150;
+    volEl.className = 'value ' + (volOk ? '' : 'badge-warn');
+  }
+
+  // Circuit breaker — derive from win/loss sequence
+  const cbEl  = document.getElementById('circuit-status');
+  const cbSub = document.getElementById('circuit-sub');
+  const losses = d.losses || 0; const wins = d.wins || 0;
+  if (d.settled === 0) {
+    cbEl.textContent = '—';
+  } else {
+    // Simple proxy: look at last settled trades for streak
+    const recent = (d.trades || []).slice(-6);
+    let streak = 0;
+    for (let i = recent.length - 1; i >= 0; i--) {
+      if (!recent[i].won) streak++; else break;
+    }
+    cbEl.textContent = streak === 0 ? 'OK' : streak + ' loss streak';
+    cbEl.className   = 'value ' + (streak >= 4 ? 'badge-bad' : streak >= 2 ? 'badge-warn' : 'badge-ok');
+    cbSub.textContent = streak >= 4 ? 'Trading paused today' : streak >= 2 ? 'Half-size mode' : 'Normal size';
+  }
+
+  // Per-asset P&L table
+  const assetTb = document.getElementById('asset-body');
+  const pa = d.per_asset || {};
+  if (Object.keys(pa).length === 0) {
+    assetTb.innerHTML = '<tr><td colspan="5" class="empty">No settled trades yet</td></tr>';
+  } else {
+    assetTb.innerHTML = Object.entries(pa)
+      .sort((a,b) => b[1].pnl - a[1].pnl)
+      .map(([asset, v]) => {
+        const pc = v.pnl >= 0 ? 'pnl pos' : 'pnl neg';
+        const wr = v.win_rate;
+        const wrC = wr >= 55 ? 'badge-ok' : wr >= 40 ? '' : 'badge-bad';
+        return `<tr>
+          <td style="font-weight:600">${asset}</td>
+          <td>${v.trades}</td>
+          <td style="color:#6b7280">${v.wins}W / ${v.losses}L</td>
+          <td class="${pc}">${v.pnl >= 0 ? '+' : ''}$${Math.abs(v.pnl).toFixed(2)}</td>
+          <td class="${wrC}">${wr}%</td>
+        </tr>`;
+      }).join('');
+  }
+
+  // Edge quartile table
+  const edgeTb = document.getElementById('edge-body');
+  const eq = d.edge_quartiles || {};
+  if (Object.keys(eq).length === 0) {
+    edgeTb.innerHTML = '<tr><td colspan="5" class="empty">No settled trades yet</td></tr>';
+  } else {
+    const order = ['12–15%','15–20%','20–30%','30%+'];
+    edgeTb.innerHTML = order.filter(k => eq[k]).map(k => {
+      const v   = eq[k];
+      const wr  = v.win_rate;
+      const clr = wr >= 55 ? '#34d399' : wr >= 40 ? '#fbbf24' : '#f87171';
+      const pnlC = v.avg_pnl >= 0 ? 'pnl pos' : 'pnl neg';
+      return `<tr>
+        <td style="font-weight:600;color:#9ca3af">${k}</td>
+        <td>${v.trades}</td>
+        <td style="color:${clr}">${wr}%</td>
+        <td><div class="eq-bar-wrap"><div class="eq-bar" style="width:${wr}%;background:${clr}"></div></div></td>
+        <td class="${pnlC}">${v.avg_pnl >= 0 ? '+' : ''}$${Math.abs(v.avg_pnl).toFixed(2)}</td>
+      </tr>`;
+    }).join('');
   }
 
   // Calibration

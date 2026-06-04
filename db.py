@@ -48,11 +48,14 @@ if DATABASE_URL:
                         order_id     TEXT
                     )
                 """)
-                # Outcome columns — added after initial schema; idempotent on existing tables
+                # Extra columns — added after initial schema; idempotent on existing tables
                 for col_def in [
-                    "outcome     TEXT",      # 'won', 'lost', 'unfilled'
-                    "result      TEXT",      # 'yes' or 'no' (what Kalshi settled)
-                    "settled_pnl REAL",      # actual dollars won or lost
+                    "outcome          TEXT",   # 'won', 'lost', 'unfilled'
+                    "result           TEXT",   # 'yes' or 'no' (what Kalshi settled)
+                    "settled_pnl      REAL",   # actual dollars won or lost
+                    "vol_used         REAL",   # annualized vol fed to BS model at placement
+                    "drift_used       REAL",   # annualized drift fed to BS model at placement
+                    "spot_at_placement REAL",  # RTI price at placement
                 ]:
                     cur.execute(f"ALTER TABLE trades ADD COLUMN IF NOT EXISTS {col_def}")
             conn.commit()
@@ -66,17 +69,38 @@ if DATABASE_URL:
 
     def save_trade(record: dict):
         """Insert a single trade record."""
+        # Normalise to guarantee all columns are present (old records may lack new fields)
+        row = {
+            "ts":                 record.get("ts"),
+            "ticker":             record.get("ticker"),
+            "asset":              record.get("asset"),
+            "threshold":          record.get("threshold"),
+            "above":              record.get("above"),
+            "side":               record.get("side"),
+            "contracts":          record.get("contracts"),
+            "price":              record.get("price"),
+            "fair_prob":          record.get("fair_prob"),
+            "edge":               record.get("edge"),
+            "minutes_left":       record.get("minutes_left"),
+            "dry_run":            record.get("dry_run", False),
+            "order_id":           record.get("order_id"),
+            "vol_used":           record.get("vol_used"),
+            "drift_used":         record.get("drift_used"),
+            "spot_at_placement":  record.get("spot_at_placement"),
+        }
         with _conn() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
                     INSERT INTO trades
                         (ts, ticker, asset, threshold, above, side, contracts,
-                         price, fair_prob, edge, minutes_left, dry_run, order_id)
+                         price, fair_prob, edge, minutes_left, dry_run, order_id,
+                         vol_used, drift_used, spot_at_placement)
                     VALUES
                         (%(ts)s, %(ticker)s, %(asset)s, %(threshold)s, %(above)s,
                          %(side)s, %(contracts)s, %(price)s, %(fair_prob)s, %(edge)s,
-                         %(minutes_left)s, %(dry_run)s, %(order_id)s)
-                """, record)
+                         %(minutes_left)s, %(dry_run)s, %(order_id)s,
+                         %(vol_used)s, %(drift_used)s, %(spot_at_placement)s)
+                """, row)
             conn.commit()
 
     def update_trade_outcome(ts: str, ticker: str, outcome: str, result: str, settled_pnl: float):
