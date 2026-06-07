@@ -744,14 +744,18 @@ class WhaleCryptoBot:
 
             try:
                 market = self.kalshi.get_market(ticker)
-            except Exception:
+            except Exception as e:
+                logger.debug(f"Backfill: could not fetch {ticker}: {e}")
                 continue
 
-            if market.get("status") != "settled":
+            mkt_status = market.get("status", "unknown")
+            if mkt_status != "settled":
+                logger.debug(f"Backfill: {ticker} status={mkt_status!r} (not settled yet)")
                 continue
 
             result = (market.get("result") or "").lower()
             if not result:
+                logger.warning(f"Backfill: {ticker} is settled but result field is empty — raw={market}")
                 continue
 
             # For live orders verify fill count; dry-run assumes filled
