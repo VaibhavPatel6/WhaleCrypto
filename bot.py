@@ -749,7 +749,7 @@ class WhaleCryptoBot:
                 continue
 
             mkt_status = market.get("status", "unknown")
-            if mkt_status != "settled":
+            if mkt_status not in ("settled", "finalized"):
                 logger.info(f"Backfill: {ticker} status={mkt_status!r} (not settled yet)")
                 continue
 
