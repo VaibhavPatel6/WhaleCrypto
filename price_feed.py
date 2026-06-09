@@ -196,8 +196,13 @@ class CFBenchmarkFeed:
 
     def get_recent_drift(self, asset: str, lookback_candles: int = 8) -> float:
         """
-        Annualized drift from the last `lookback_candles` 15-min candles (2 h).
-        Capped at ±200%/yr.  Cached 15 min.
+        Raw log return over the last lookback_candles × 15-min periods (2 h default).
+        NOT annualized — returns actual price change, e.g. -0.005 = fell 0.5%.
+        Capped at ±0.05 to exclude flash crashes.  Cached 15 min.
+
+        This is fed into fair_prob_above() which scales it to the remaining horizon
+        and caps it at ±1σ√T, so a single volatile candle can't flip probability
+        to an extreme.
         """
         asset = asset.upper()
         cached = self._drift_cache.get(asset)
@@ -219,12 +224,12 @@ class CFBenchmarkFeed:
             if len(closes) < 2:
                 return 0.0
 
-            log_returns  = [math.log(closes[i] / closes[i + 1]) for i in range(len(closes) - 1)]
-            mean_per_period = sum(log_returns) / len(log_returns)
-            drift = max(-2.0, min(2.0, mean_per_period * PERIODS_PER_YEAR))
+            # Total log return over the window (not per-period, not annualized)
+            total_return = math.log(closes[0] / closes[-1])
+            drift = max(-0.05, min(0.05, total_return))
 
             self._drift_cache[asset] = (drift, time.time())
-            logger.info(f"{asset} drift (2h momentum): {drift:+.1%}/yr")
+            logger.info(f"{asset} 2h momentum: {drift:+.4f} ({drift*100:+.2f}%)")
             return drift
 
         except Exception as e:

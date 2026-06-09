@@ -148,19 +148,24 @@ def fair_prob_above(
     strike: float,
     minutes: float,
     annual_vol: float,
-    annual_drift: float = 0.0,
+    drift: float = 0.0,
 ) -> float:
     """
-    P(S_T > strike) under GBM with drift:
-      d2 = [ln(S/K) + (μ − σ²/2)·T] / (σ·√T)
-      P = N(d2)
+    P(S_T > strike) under GBM.
+
+    drift: raw log return over the 2-hour momentum lookback (NOT annualized).
+           e.g. -0.005 = price fell 0.5% in the past 2 hours.
+           Scaled to the remaining horizon T and capped at ±1σ√T so a single
+           volatile candle cannot flip the probability to an extreme.
     """
     T = minutes / (365 * 24 * 60)
     if T <= 0:
         return 1.0 if spot > strike else 0.0
-    d2 = (math.log(spot / strike) + (annual_drift - annual_vol ** 2 / 2) * T) / (
-        annual_vol * math.sqrt(T)
-    )
+    vol_sqrt_T = annual_vol * math.sqrt(T)
+    # Scale 2h momentum to remaining horizon; cap at ±1σ to prevent distortion
+    momentum_T = drift * (minutes / 120.0)
+    momentum_T = max(-vol_sqrt_T, min(vol_sqrt_T, momentum_T))
+    d2 = (math.log(spot / strike) + momentum_T - (annual_vol ** 2 / 2) * T) / vol_sqrt_T
     return norm_cdf(d2)
 
 
@@ -416,6 +421,15 @@ class WhaleCryptoBot:
             elif heavy_buy_prs:
                 logger.info(f"{asset} heavy buy pressure (ratio={pressure:.2f}) → skipping bearish bets")
 
+            # Orderbook pressure is real-time; trend is lagging.
+            # When they conflict, trust the orderbook — it overrides the trend filter.
+            if heavy_buy_prs and skip_yes_above:
+                logger.info(f"{asset} buy pressure overrides downtrend → allowing YES-above bets")
+                skip_yes_above = False
+            if heavy_sell_prs and skip_no_above:
+                logger.info(f"{asset} sell pressure overrides uptrend → allowing NO-above bets")
+                skip_no_above = False
+
             # ── Parse all in-window markets first (needed for monotonicity) ──
             in_window_markets: list[MarketInfo] = []
             for raw in raw_markets:
@@ -424,6 +438,19 @@ class WhaleCryptoBot:
                     in_window_markets.append(info)
 
             logger.info(f"{asset}: {len(raw_markets)} markets total, {len(in_window_markets)} in time window")
+
+            # BTC diagnostic: when nothing passes, show why the nearest markets fail
+            if asset == "BTC" and len(in_window_markets) == 0 and raw_markets:
+                now = datetime.now(timezone.utc)
+                samples = []
+                for r in raw_markets[:5]:
+                    ct    = _parse_close_time(r)
+                    mins  = round((ct - now).total_seconds() / 60) if ct else None
+                    parsed = _parse_title(r.get("title", "")) or _parse_ticker(r.get("ticker", ""))
+                    thresh = parsed[1] if parsed else None
+                    otm_str = f"otm={abs(thresh-spot)/spot:.1%}" if thresh else "no-thresh"
+                    samples.append(f"{r.get('ticker','?')[-14:]} mins={mins} {otm_str}")
+                logger.info(f"BTC zero in window — sample: {' | '.join(samples)}")
 
             # ── Priority 4: Monotonicity check ───────────────────────────────
             # For "above" markets at the same expiry, YES price must decrease
