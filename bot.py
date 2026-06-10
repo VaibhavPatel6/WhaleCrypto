@@ -212,6 +212,29 @@ def _parse_close_time(raw: dict) -> Optional[datetime]:
     return None
 
 
+# ─── Horizon-scaled edge threshold ───────────────────────────────────────────────
+
+HORIZON_FLAT_MINUTES = float(os.getenv("HORIZON_FLAT_MINUTES", "360"))   # no premium ≤ 6h
+HORIZON_FULL_MINUTES = float(os.getenv("HORIZON_FULL_MINUTES", "1440"))  # max premium at 24h
+HORIZON_MAX_PREMIUM  = float(os.getenv("HORIZON_MAX_PREMIUM",  "0.06"))  # +6% at full horizon
+
+
+def horizon_threshold(base: float, minutes_left: float) -> float:
+    """
+    Edge required scales with time to resolution.
+
+    Model error (vol misestimation, momentum decay) compounds with horizon,
+    so a 12% edge on a 2h market is far more trustworthy than the same edge
+    on a 24h market.  Below HORIZON_FLAT_MINUTES the base threshold applies;
+    beyond it the requirement ramps linearly up to base + HORIZON_MAX_PREMIUM
+    at HORIZON_FULL_MINUTES.
+    """
+    if minutes_left <= HORIZON_FLAT_MINUTES:
+        return base
+    frac = min(1.0, (minutes_left - HORIZON_FLAT_MINUTES) / (HORIZON_FULL_MINUTES - HORIZON_FLAT_MINUTES))
+    return base + HORIZON_MAX_PREMIUM * frac
+
+
 # ─── Kelly position sizing ───────────────────────────────────────────────────────
 
 def kelly_contracts(edge: float, price: float, balance: float) -> int:
@@ -506,26 +529,40 @@ class WhaleCryptoBot:
                     )
                     continue
 
+                # Edge required scales with time to resolution — model error
+                # compounds with horizon, so far-dated markets need more edge.
+                required_edge = horizon_threshold(threshold, info.minutes_left)
+
                 # YES leg — bullish on "above" markets, bearish on "below" markets
                 # Block if trend filter fires, or if spot pressure opposes the bet
                 yes_bullish = info.above   # YES-above = bullish; YES-below = bearish
                 yes_vs_pressure = (yes_bullish and heavy_sell_prs) or (not yes_bullish and heavy_buy_prs)
                 if not skip_yes_above and not yes_vs_pressure and 0.02 < info.yes_ask < 0.98:
                     edge = p_yes - info.yes_ask - KALSHI_FEE
-                    if edge >= threshold:
+                    if edge >= required_edge:
                         n = max(1, int(kelly_contracts(edge, info.yes_ask, balance) * size_mult))
                         signals.append(Signal(info, "yes", p_yes, info.yes_ask, edge, n, n * edge,
                                               vol_used=vol, drift_used=drift, spot_at_placement=spot))
+                    elif edge >= threshold:
+                        logger.info(
+                            f"Skip {info.ticker} YES: edge {edge:.1%} < {required_edge:.1%} "
+                            f"required at {info.minutes_left:.0f}min horizon"
+                        )
 
                 # NO leg — bearish on "above" markets, bullish on "below" markets
                 no_bearish = info.above    # NO-above = bearish; NO-below = bullish
                 no_vs_pressure = (no_bearish and heavy_buy_prs) or (not no_bearish and heavy_sell_prs)
                 if not skip_no_above and not no_vs_pressure and 0.02 < info.no_ask < 0.98:
                     edge = (1.0 - p_yes) - info.no_ask - KALSHI_FEE
-                    if edge >= threshold:
+                    if edge >= required_edge:
                         n = max(1, int(kelly_contracts(edge, info.no_ask, balance) * size_mult))
                         signals.append(Signal(info, "no", p_yes, info.no_ask, edge, n, n * edge,
                                               vol_used=vol, drift_used=drift, spot_at_placement=spot))
+                    elif edge >= threshold:
+                        logger.info(
+                            f"Skip {info.ticker} NO: edge {edge:.1%} < {required_edge:.1%} "
+                            f"required at {info.minutes_left:.0f}min horizon"
+                        )
 
         signals.sort(key=lambda s: s.edge, reverse=True)
         return signals, total_markets
@@ -929,6 +966,8 @@ class WhaleCryptoBot:
         logger.info(f"  Price source : CF Benchmark RTI (constituent-exchange median)")
         logger.info(f"  Assets       : {', '.join(CRYPTO_SERIES)}  ({len(CRYPTO_SERIES)} series)")
         logger.info(f"  Edge thresh  : {EDGE_THRESHOLD:.0%} (raised to 15% during US hours 13–21 UTC)")
+        logger.info(f"  Horizon prem : +0–{HORIZON_MAX_PREMIUM:.0%} edge required from "
+                    f"{HORIZON_FLAT_MINUTES:.0f}min to {HORIZON_FULL_MINUTES:.0f}min to close")
         logger.info(f"  Circuit breaker: half-size after 2 losses, pause after 4 losses")
         logger.info(f"  Pressure filter: skip bets vs heavy spot imbalance (ratio <0.70 or >1.40)")
         logger.info(f"  OTM filter   : ±{MAX_OTM_PCT:.0%} of RTI")
