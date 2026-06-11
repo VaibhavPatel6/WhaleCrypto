@@ -335,16 +335,24 @@ class WhaleCryptoBot:
         if not asset:
             return None
 
-        # ── Layer 1: reject non-binary market types ──────────────────────────
-        # Kalshi exposes a market_type field; we only want plain binary markets.
-        market_type = (raw.get("market_type") or raw.get("category") or "").lower()
-        if market_type and market_type not in ("binary", ""):
-            logger.debug(f"Skip {ticker}: non-binary market_type='{market_type}'")
+        # ── Authoritative market-type check via strike_type ──────────────────
+        # Kalshi's API marks every market with strike_type:
+        #   'greater' → true binary "above floor_strike"
+        #   'less'    → true binary "below cap_strike"
+        #   'between' → RANGE market (floor_strike–cap_strike bracket)
+        # CRITICAL: range markets use -B<midpoint> tickers that look identical
+        # to binary "above" tickers, market_type='binary', and generic titles
+        # with no "range" keyword.  strike_type is the ONLY reliable field.
+        strike_type = (raw.get("strike_type") or "").lower()
+        if strike_type == "between":
+            logger.debug(f"Skip {ticker}: range market (strike_type=between, "
+                         f"floor={raw.get('floor_strike')} cap={raw.get('cap_strike')})")
+            return None
+        if strike_type not in ("greater", "less"):
+            logger.debug(f"Skip {ticker}: unknown strike_type={strike_type!r}")
             return None
 
-        # ── Layer 2: reject range/bracket markets by title keyword ───────────
-        # Range market titles always contain "range" or "between".
-        # This is the most reliable signal and catches all known Kalshi range market formats.
+        # Defense-in-depth: also reject range keywords in titles
         if re.search(r"\b(range|between|bracket)\b", title, re.IGNORECASE):
             logger.debug(f"Skip {ticker}: range market (title='{title[:60]}')")
             return None
@@ -357,21 +365,22 @@ class WhaleCryptoBot:
         if not (MIN_MINUTES <= minutes_left <= MAX_MINUTES):
             return None
 
-        parsed = _parse_title(title) or _parse_ticker(ticker)
-        if not parsed:
+        # Direction and strike come from the API fields, never from the ticker:
+        # ticker suffixes are ambiguous (-B is a range midpoint, -T appears on
+        # both 'greater' and 'less' tail markets).
+        if strike_type == "greater":
+            above     = True
+            threshold = raw.get("floor_strike")
+        else:  # 'less'
+            above     = False
+            threshold = raw.get("cap_strike")
+        if threshold is None:
+            logger.debug(f"Skip {ticker}: strike_type={strike_type} but no strike field")
             return None
-        above, threshold = parsed
+        threshold = float(threshold)
 
-        # Skip ghost markets sitting between real Kalshi strikes.
-        # Allow both exact multiples (remainder=0) and half-step offsets (remainder=step/2)
-        # because Kalshi uses offset grids on some assets (e.g. BTC: 70050, 70150, 70250).
-        step = STRIKE_STEP.get(asset)
-        if step:
-            remainder = round(threshold % step, 6)
-            half      = round(step / 2, 6)
-            if remainder != 0 and abs(remainder - half) > 0.0001 and abs(remainder - step) > 0.001:
-                logger.debug(f"Skip {ticker}: ${threshold} not on ${step} grid (ghost market)")
-                return None
+        # (Strike-grid ghost check removed: strikes now come from the API's
+        #  floor/cap fields, which are authoritative — no ghost tickers possible.)
 
         # Skip deep OTM strikes — spreads are wide and model error dominates
         if abs(threshold - spot) / spot > MAX_OTM_PCT:
