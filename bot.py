@@ -86,18 +86,6 @@ CRYPTO_SERIES: dict[str, str] = {
     "LTC":  "KXLTC",
 }
 
-# Strike grid for each asset.
-# Kalshi changes increments as price levels shift — verified from live ticker data.
-# The check allows both exact multiples AND half-step offsets (e.g. BTC uses +50 offset).
-# Any strike not matching either pattern is a ghost market with a stale orderbook.
-STRIKE_STEP: dict[str, float] = {
-    "BTC":  100,    # B70050 / B70150 / B70250 ... (+50 offset from round hundreds)
-    "ETH":  20,     # B1840 / B1860 / B1880 ...
-    "SOL":  1,      # $73 / $74 / $75 ...
-    "XRP":  0.02,   # $1.3099500 / $1.3299500 ... (~0.01 offset from round cents)
-    "DOGE": 0.005,  # typical DOGE increment
-}
-
 # trade_history.json kept for local dev; db.py swaps it for Postgres on Railway
 
 
@@ -106,19 +94,28 @@ STRIKE_STEP: dict[str, float] = {
 @dataclass
 class MarketInfo:
     ticker: str
-    asset: str            # "BTC" or "ETH"
-    threshold: float      # USD price in the market title
-    above: bool           # True → YES wins if price > threshold
+    asset: str            # "BTC", "ETH", ...
+    threshold: float      # strike for binaries; bracket midpoint for ranges
+    above: bool           # binaries: True → YES wins if price > threshold
     close_time: datetime
     minutes_left: float
     yes_bid: float
     yes_ask: float
     no_bid: float
     no_ask: float
+    kind: str = "above"             # 'above' | 'below' | 'range'
+    floor: Optional[float] = None   # range markets: YES wins if floor ≤ S ≤ cap
+    cap:   Optional[float] = None
 
     @property
     def yes_mid(self) -> float:
         return (self.yes_bid + self.yes_ask) / 2
+
+    @property
+    def describe(self) -> str:
+        if self.kind == "range":
+            return f"${self.floor:,.2f}–{self.cap:,.2f} range"
+        return f"${self.threshold:,.2f} {self.kind}"
 
 
 @dataclass
@@ -162,41 +159,34 @@ def fair_prob_above(
     if T <= 0:
         return 1.0 if spot > strike else 0.0
     vol_sqrt_T = annual_vol * math.sqrt(T)
-    # Scale 2h momentum to remaining horizon; cap at ±1σ to prevent distortion
-    momentum_T = drift * (minutes / 120.0)
+    # Scale 2h momentum to remaining horizon with sqrt decay (momentum doesn't
+    # persist linearly), then cap at ±1σ√T so it can shift but never dominate.
+    momentum_T = drift * math.sqrt(minutes / 120.0)
     momentum_T = max(-vol_sqrt_T, min(vol_sqrt_T, momentum_T))
     d2 = (math.log(spot / strike) + momentum_T - (annual_vol ** 2 / 2) * T) / vol_sqrt_T
     return norm_cdf(d2)
 
 
+def fair_prob_range(
+    spot: float,
+    floor: float,
+    cap: float,
+    minutes: float,
+    annual_vol: float,
+    drift: float = 0.0,
+) -> float:
+    """
+    P(floor < S_T < cap) for a Kalshi range/bracket market:
+    the difference of two binary probabilities under the same GBM model.
+    """
+    return max(0.0, fair_prob_above(spot, floor, minutes, annual_vol, drift)
+                  - fair_prob_above(spot, cap,   minutes, annual_vol, drift))
+
+
 # ─── Market parsing ───────────────────────────────────────────────────────────────
-
-def _parse_ticker(ticker: str) -> Optional[tuple[bool, float]]:
-    """
-    Extract (above, threshold) from ticker like KXBTC-26MAY2417-B76625.
-
-    Range markets (e.g. KXETH-25MAY2417-R1730-T1769) must be excluded.
-    Their ticker ends with -T<num> just like a plain "below" binary market,
-    so we explicitly reject any ticker that contains the range indicator -R<num>.
-    """
-    # Kalshi range market tickers contain -R followed by digits (e.g. -R1730-T1769)
-    if re.search(r"-R\d", ticker):
-        return None
-    m = re.search(r"-([BT])([\d.]+)$", ticker)
-    if not m:
-        return None
-    above = m.group(1).upper() == "B"
-    return above, float(m.group(2))
-
-
-def _parse_title(title: str) -> Optional[tuple[bool, float]]:
-    """Extract (above, threshold) from title like 'Will BTC be above $76,625 at ...'"""
-    m = re.search(r"\b(above|below)\s+\$([0-9,]+(?:\.[0-9]+)?)", title, re.IGNORECASE)
-    if not m:
-        return None
-    above = m.group(1).lower() == "above"
-    return above, float(m.group(2).replace(",", ""))
-
+# Direction and strikes come exclusively from the API's strike_type /
+# floor_strike / cap_strike fields.  Ticker and title parsing were removed:
+# -B<num> tickers are range midpoints, not strikes, and titles are generic.
 
 def _parse_close_time(raw: dict) -> Optional[datetime]:
     for key in ("close_time", "expiration_time", "expiration_ts"):
@@ -335,26 +325,15 @@ class WhaleCryptoBot:
         if not asset:
             return None
 
-        # ── Authoritative market-type check via strike_type ──────────────────
-        # Kalshi's API marks every market with strike_type:
-        #   'greater' → true binary "above floor_strike"
-        #   'less'    → true binary "below cap_strike"
-        #   'between' → RANGE market (floor_strike–cap_strike bracket)
-        # CRITICAL: range markets use -B<midpoint> tickers that look identical
-        # to binary "above" tickers, market_type='binary', and generic titles
-        # with no "range" keyword.  strike_type is the ONLY reliable field.
+        # ── Market type from the authoritative strike_type field ─────────────
+        #   'greater' → binary "above floor_strike"
+        #   'less'    → binary "below cap_strike"
+        #   'between' → range market: YES wins if floor_strike ≤ S ≤ cap_strike
+        # Ticker suffixes are ambiguous (-B<num> is a range MIDPOINT, not an
+        # "above" strike) and API titles are generic — never parse those.
         strike_type = (raw.get("strike_type") or "").lower()
-        if strike_type == "between":
-            logger.debug(f"Skip {ticker}: range market (strike_type=between, "
-                         f"floor={raw.get('floor_strike')} cap={raw.get('cap_strike')})")
-            return None
-        if strike_type not in ("greater", "less"):
+        if strike_type not in ("greater", "less", "between"):
             logger.debug(f"Skip {ticker}: unknown strike_type={strike_type!r}")
-            return None
-
-        # Defense-in-depth: also reject range keywords in titles
-        if re.search(r"\b(range|between|bracket)\b", title, re.IGNORECASE):
-            logger.debug(f"Skip {ticker}: range market (title='{title[:60]}')")
             return None
 
         close_time = _parse_close_time(raw)
@@ -365,25 +344,33 @@ class WhaleCryptoBot:
         if not (MIN_MINUTES <= minutes_left <= MAX_MINUTES):
             return None
 
-        # Direction and strike come from the API fields, never from the ticker:
-        # ticker suffixes are ambiguous (-B is a range midpoint, -T appears on
-        # both 'greater' and 'less' tail markets).
-        if strike_type == "greater":
-            above     = True
-            threshold = raw.get("floor_strike")
-        else:  # 'less'
-            above     = False
-            threshold = raw.get("cap_strike")
-        if threshold is None:
-            logger.debug(f"Skip {ticker}: strike_type={strike_type} but no strike field")
+        # Direction and strikes come from the API fields, never from the ticker.
+        floor_s = raw.get("floor_strike")
+        cap_s   = raw.get("cap_strike")
+        kind: str
+        floor: Optional[float] = None
+        cap:   Optional[float] = None
+        if strike_type == "greater" and floor_s is not None:
+            kind, above, threshold = "above", True, float(floor_s)
+        elif strike_type == "less" and cap_s is not None:
+            kind, above, threshold = "below", False, float(cap_s)
+        elif strike_type == "between" and floor_s is not None and cap_s is not None:
+            floor, cap = float(floor_s), float(cap_s)
+            if cap <= floor:
+                return None
+            kind, above, threshold = "range", True, round((floor + cap) / 2, 6)
+        else:
+            logger.debug(f"Skip {ticker}: strike_type={strike_type} missing strike fields")
             return None
-        threshold = float(threshold)
 
-        # (Strike-grid ghost check removed: strikes now come from the API's
-        #  floor/cap fields, which are authoritative — no ghost tickers possible.)
-
-        # Skip deep OTM strikes — spreads are wide and model error dominates
-        if abs(threshold - spot) / spot > MAX_OTM_PCT:
+        # Skip deep OTM markets — spreads are wide and model error dominates.
+        # For ranges, distance is from spot to the nearest bracket edge
+        # (zero when spot sits inside the bracket).
+        if kind == "range":
+            distance = max(0.0, floor - spot, spot - cap)
+        else:
+            distance = abs(threshold - spot)
+        if distance / spot > MAX_OTM_PCT:
             return None
 
         try:
@@ -411,6 +398,9 @@ class WhaleCryptoBot:
             yes_ask=yes_ask,
             no_bid=no_bid,
             no_ask=no_ask,
+            kind=kind,
+            floor=floor,
+            cap=cap,
         )
 
     # ── Signal generation ────────────────────────────────────────────────────────
@@ -431,15 +421,15 @@ class WhaleCryptoBot:
             drift = self.feed.get_recent_drift(asset)
 
             # ── Priority 1: Trend filter ─────────────────────────────────────
-            # Don't bet NO on "above" markets during a strong up-trend, and
-            # don't bet YES on "above" markets during a strong down-trend.
-            trend_6h = self.feed.get_return(asset, lookback_candles=24)
-            skip_no_above  = trend_6h >  TREND_SKIP_PCT   # up-trend  → don't short
-            skip_yes_above = trend_6h < -TREND_SKIP_PCT   # down-trend → don't go long
-            if skip_no_above:
-                logger.info(f"{asset} 6h trend +{trend_6h:.1%} → skipping NO-above bets (don't fight the trend)")
-            elif skip_yes_above:
-                logger.info(f"{asset} 6h trend {trend_6h:.1%} → skipping YES-above bets (don't fight the trend)")
+            # Don't take bearish bets in a strong up-trend or bullish bets in
+            # a strong down-trend.  (Direction per market is computed below.)
+            trend_6h   = self.feed.get_return(asset, lookback_candles=24)
+            skip_short = trend_6h >  TREND_SKIP_PCT   # up-trend  → no bearish bets
+            skip_long  = trend_6h < -TREND_SKIP_PCT   # down-trend → no bullish bets
+            if skip_short:
+                logger.info(f"{asset} 6h trend +{trend_6h:.1%} → skipping bearish bets (don't fight the trend)")
+            elif skip_long:
+                logger.info(f"{asset} 6h trend {trend_6h:.1%} → skipping bullish bets (don't fight the trend)")
 
             # ── Spot orderbook pressure ──────────────────────────────────────
             # Bid/ask dollar-volume ratio from Coinbase: < 0.70 = heavy sell
@@ -455,12 +445,12 @@ class WhaleCryptoBot:
 
             # Orderbook pressure is real-time; trend is lagging.
             # When they conflict, trust the orderbook — it overrides the trend filter.
-            if heavy_buy_prs and skip_yes_above:
-                logger.info(f"{asset} buy pressure overrides downtrend → allowing YES-above bets")
-                skip_yes_above = False
-            if heavy_sell_prs and skip_no_above:
-                logger.info(f"{asset} sell pressure overrides uptrend → allowing NO-above bets")
-                skip_no_above = False
+            if heavy_buy_prs and skip_long:
+                logger.info(f"{asset} buy pressure overrides downtrend → allowing bullish bets")
+                skip_long = False
+            if heavy_sell_prs and skip_short:
+                logger.info(f"{asset} sell pressure overrides uptrend → allowing bearish bets")
+                skip_short = False
 
             # ── Parse all in-window markets first (needed for monotonicity) ──
             in_window_markets: list[MarketInfo] = []
@@ -471,64 +461,57 @@ class WhaleCryptoBot:
 
             logger.info(f"{asset}: {len(raw_markets)} markets total, {len(in_window_markets)} in time window")
 
-            # BTC diagnostic: when nothing passes, show why the nearest markets fail
-            if asset == "BTC" and len(in_window_markets) == 0 and raw_markets:
-                now = datetime.now(timezone.utc)
-                samples = []
-                for r in raw_markets[:5]:
-                    ct    = _parse_close_time(r)
-                    mins  = round((ct - now).total_seconds() / 60) if ct else None
-                    parsed = _parse_title(r.get("title", "")) or _parse_ticker(r.get("ticker", ""))
-                    thresh = parsed[1] if parsed else None
-                    otm_str = f"otm={abs(thresh-spot)/spot:.1%}" if thresh else "no-thresh"
-                    samples.append(f"{r.get('ticker','?')[-14:]} mins={mins} {otm_str}")
-                logger.info(f"BTC zero in window — sample: {' | '.join(samples)}")
+            # ── Stale-book sanity checks ─────────────────────────────────────
+            # Everything starts valid; violators are discarded.
+            valid_tickers: set[str] = {m.ticker for m in in_window_markets}
 
-            # ── Priority 4: Monotonicity check ───────────────────────────────
-            # For "above" markets at the same expiry, YES price must decrease
-            # as the strike increases. Violations signal a ghost/stale orderbook.
-            # Build a set of tickers that pass the check.
-            valid_tickers: set[str] = set()
-            by_expiry: dict[str, list[MarketInfo]] = {}
+            # Binary 'above' markets at one expiry: YES mid must decrease as
+            # the strike rises.  Violations signal a ghost/stale orderbook.
+            above_by_expiry: dict[datetime, list[MarketInfo]] = {}
+            range_by_expiry: dict[datetime, list[MarketInfo]] = {}
             for info in in_window_markets:
-                key = f"{info.close_time.date()}_{info.above}"
-                by_expiry.setdefault(key, []).append(info)
+                if info.kind == "above":
+                    above_by_expiry.setdefault(info.close_time, []).append(info)
+                elif info.kind == "range":
+                    range_by_expiry.setdefault(info.close_time, []).append(info)
 
-            for group in by_expiry.values():
-                above_group = [m for m in group if m.above]
-                above_group.sort(key=lambda m: m.threshold)
-                monotonic = True
-                for i in range(1, len(above_group)):
-                    prev, curr = above_group[i - 1], above_group[i]
-                    # Higher strike must have lower or equal YES mid
+            for group in above_by_expiry.values():
+                group.sort(key=lambda m: m.threshold)
+                for prev, curr in zip(group, group[1:]):
                     if curr.yes_mid > prev.yes_mid + 0.02:   # 2¢ tolerance for spread noise
                         logger.info(
                             f"Monotonicity violation: {prev.ticker} ({prev.yes_mid:.0%}) < "
                             f"{curr.ticker} ({curr.yes_mid:.0%}) — skipping both"
                         )
-                        monotonic = False
-                        # Mark both the violating pair as invalid
                         valid_tickers.discard(prev.ticker)
                         valid_tickers.discard(curr.ticker)
-                    elif monotonic:
-                        valid_tickers.add(prev.ticker)
-                        valid_tickers.add(curr.ticker)
-                # Single-market groups are always valid
-                if len(above_group) == 1:
-                    valid_tickers.add(above_group[0].ticker)
-                # Below-direction markets aren't monotonicity-checked (rare)
-                for m in group:
-                    if not m.above:
-                        valid_tickers.add(m.ticker)
+
+            # Range brackets at one expiry are mutually exclusive, so their
+            # YES mids can sum to at most ~1 (less when we only see a subset).
+            # A sum well above 1 means stale/crossed books — skip the group.
+            for close_t, group in range_by_expiry.items():
+                total_prob = sum(m.yes_mid for m in group)
+                if total_prob > 1.15:
+                    logger.info(
+                        f"{asset} range books stale: Σ yes_mid={total_prob:.2f} across "
+                        f"{len(group)} brackets @ {close_t:%m-%d %H:%M} — skipping group"
+                    )
+                    for m in group:
+                        valid_tickers.discard(m.ticker)
 
             # ── Generate signals ─────────────────────────────────────────────
             for info in in_window_markets:
                 if info.ticker not in valid_tickers:
                     continue
 
-                p_yes = fair_prob_above(spot, info.threshold, info.minutes_left, vol, drift)
-                if not info.above:
-                    p_yes = 1.0 - p_yes
+                # Fair P(YES) by market kind
+                if info.kind == "range":
+                    p_yes = fair_prob_range(spot, info.floor, info.cap,
+                                            info.minutes_left, vol, drift)
+                elif info.kind == "above":
+                    p_yes = fair_prob_above(spot, info.threshold, info.minutes_left, vol, drift)
+                else:  # 'below'
+                    p_yes = 1.0 - fair_prob_above(spot, info.threshold, info.minutes_left, vol, drift)
 
                 # Sanity guard: skip if model and market mid diverge wildly
                 if abs(p_yes - info.yes_mid) > MAX_DIVERGENCE:
@@ -542,11 +525,28 @@ class WhaleCryptoBot:
                 # compounds with horizon, so far-dated markets need more edge.
                 required_edge = horizon_threshold(threshold, info.minutes_left)
 
-                # YES leg — bullish on "above" markets, bearish on "below" markets
-                # Block if trend filter fires, or if spot pressure opposes the bet
-                yes_bullish = info.above   # YES-above = bullish; YES-below = bearish
-                yes_vs_pressure = (yes_bullish and heavy_sell_prs) or (not yes_bullish and heavy_buy_prs)
-                if not skip_yes_above and not yes_vs_pressure and 0.02 < info.yes_ask < 0.98:
+                # Direction of the YES leg:
+                #   +1 bullish, -1 bearish, 0 neutral (pin bet on a bracket
+                #   containing spot — direction filters don't apply).
+                if info.kind == "range":
+                    if info.cap < spot:
+                        yes_dir = -1          # price must fall into the bracket
+                    elif info.floor > spot:
+                        yes_dir = +1          # price must rise into the bracket
+                    else:
+                        yes_dir = 0           # spot inside bracket: pin bet
+                else:
+                    yes_dir = +1 if info.kind == "above" else -1
+
+                def _blocked(direction: int) -> bool:
+                    if direction > 0:
+                        return skip_long or heavy_sell_prs
+                    if direction < 0:
+                        return skip_short or heavy_buy_prs
+                    return False
+
+                # YES leg
+                if not _blocked(yes_dir) and 0.02 < info.yes_ask < 0.98:
                     edge = p_yes - info.yes_ask - KALSHI_FEE
                     if edge >= required_edge:
                         n = max(1, int(kelly_contracts(edge, info.yes_ask, balance) * size_mult))
@@ -558,10 +558,8 @@ class WhaleCryptoBot:
                             f"required at {info.minutes_left:.0f}min horizon"
                         )
 
-                # NO leg — bearish on "above" markets, bullish on "below" markets
-                no_bearish = info.above    # NO-above = bearish; NO-below = bullish
-                no_vs_pressure = (no_bearish and heavy_buy_prs) or (not no_bearish and heavy_sell_prs)
-                if not skip_no_above and not no_vs_pressure and 0.02 < info.no_ask < 0.98:
+                # NO leg — opposite direction of YES
+                if not _blocked(-yes_dir) and 0.02 < info.no_ask < 0.98:
                     edge = (1.0 - p_yes) - info.no_ask - KALSHI_FEE
                     if edge >= required_edge:
                         n = max(1, int(kelly_contracts(edge, info.no_ask, balance) * size_mult))
@@ -591,18 +589,17 @@ class WhaleCryptoBot:
 
     def _execute(self, sig: Signal) -> bool:
         tag = "[DRY RUN] " if self.dry_run else ""
-        direction = "above" if sig.market.above else "below"
         logger.info(
             f"{tag}BUY {sig.contracts}x {sig.market.ticker} {sig.side.upper()} "
             f"@ {sig.price:.2%} | RTI-fair={sig.fair_prob:.2%} | edge={sig.edge:.2%} | "
-            f"strike ${sig.market.threshold:,.0f} {direction} | "
+            f"{sig.market.describe} | "
             f"{sig.market.minutes_left:.0f}min | exp_profit=${sig.expected_profit:.2f}"
         )
         mode_tag = "📋 Dry Run" if self.dry_run else "⚡ LIVE"
         self._notify(
             title=f"WhaleCrypto {mode_tag}",
             message=(
-                f"{sig.market.asset} {sig.side.upper()} ${sig.market.threshold:,.0f} {direction} | "
+                f"{sig.market.asset} {sig.side.upper()} {sig.market.describe} | "
                 f"edge {sig.edge:.0%} | {sig.contracts} contracts @ {sig.price:.0%}"
             ),
         )
@@ -625,6 +622,10 @@ class WhaleCryptoBot:
             "vol_used":          round(sig.vol_used, 4),
             "drift_used":        round(sig.drift_used, 4),
             "spot_at_placement": round(sig.spot_at_placement, 2),
+            # Market kind + range bounds ('above'/'below' markets have null bounds)
+            "kind":              sig.market.kind,
+            "floor_strike":      sig.market.floor,
+            "cap_strike":        sig.market.cap,
         }
 
         if not self.dry_run:
@@ -974,6 +975,7 @@ class WhaleCryptoBot:
         logger.info(f"WhaleCrypto Bot  [{mode}]")
         logger.info(f"  Price source : CF Benchmark RTI (constituent-exchange median)")
         logger.info(f"  Assets       : {', '.join(CRYPTO_SERIES)}  ({len(CRYPTO_SERIES)} series)")
+        logger.info(f"  Market kinds : binary above/below + range brackets (priced as N(d2_floor)−N(d2_cap))")
         logger.info(f"  Edge thresh  : {EDGE_THRESHOLD:.0%} (raised to 15% during US hours 13–21 UTC)")
         logger.info(f"  Horizon prem : +0–{HORIZON_MAX_PREMIUM:.0%} edge required from "
                     f"{HORIZON_FLAT_MINUTES:.0f}min to {HORIZON_FULL_MINUTES:.0f}min to close")

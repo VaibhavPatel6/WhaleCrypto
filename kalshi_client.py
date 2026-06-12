@@ -160,11 +160,12 @@ class KalshiClient:
 
         if "orderbook_fp" in data:
             ob = data["orderbook_fp"]
-            # In orderbook_fp the field names are inverted vs. the legacy format:
-            #   no_dollars  = YES bids (buy YES orders), ascending → best bid is last
-            #   yes_dollars = NO bids (buy NO orders),  ascending → best bid is last
-            raw_yes = [(float(p), float(q)) for p, q in (ob.get("no_dollars") or [])]
-            raw_no  = [(float(p), float(q)) for p, q in (ob.get("yes_dollars") or [])]
+            # yes_dollars = YES bids, no_dollars = NO bids (ascending; best = last).
+            # Verified against live ATM range brackets: this literal mapping gives
+            # sane prices (ATM bracket YES ≈ 21¢); the swapped mapping implies
+            # impossible ones (YES ≈ 78¢ for a $40 bracket 24h out).
+            raw_yes = [(float(p), float(q)) for p, q in (ob.get("yes_dollars") or [])]
+            raw_no  = [(float(p), float(q)) for p, q in (ob.get("no_dollars") or [])]
         else:
             ob = data.get("orderbook", {})
             raw_yes = [(p / 100, q) for p, q in (ob.get("yes") or [])]

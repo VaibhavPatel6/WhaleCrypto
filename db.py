@@ -54,8 +54,11 @@ if DATABASE_URL:
                     "result           TEXT",   # 'yes' or 'no' (what Kalshi settled)
                     "settled_pnl      REAL",   # actual dollars won or lost
                     "vol_used         REAL",   # annualized vol fed to BS model at placement
-                    "drift_used       REAL",   # annualized drift fed to BS model at placement
+                    "drift_used       REAL",   # raw 2h log return fed to BS model at placement
                     "spot_at_placement REAL",  # RTI price at placement
+                    "kind             TEXT",   # 'above' | 'below' | 'range'
+                    "floor_strike     REAL",   # range markets: lower bound
+                    "cap_strike       REAL",   # range markets: upper bound
                 ]:
                     cur.execute(f"ALTER TABLE trades ADD COLUMN IF NOT EXISTS {col_def}")
             conn.commit()
@@ -87,6 +90,9 @@ if DATABASE_URL:
             "vol_used":           record.get("vol_used"),
             "drift_used":         record.get("drift_used"),
             "spot_at_placement":  record.get("spot_at_placement"),
+            "kind":               record.get("kind"),
+            "floor_strike":       record.get("floor_strike"),
+            "cap_strike":         record.get("cap_strike"),
         }
         with _conn() as conn:
             with conn.cursor() as cur:
@@ -94,12 +100,14 @@ if DATABASE_URL:
                     INSERT INTO trades
                         (ts, ticker, asset, threshold, above, side, contracts,
                          price, fair_prob, edge, minutes_left, dry_run, order_id,
-                         vol_used, drift_used, spot_at_placement)
+                         vol_used, drift_used, spot_at_placement,
+                         kind, floor_strike, cap_strike)
                     VALUES
                         (%(ts)s, %(ticker)s, %(asset)s, %(threshold)s, %(above)s,
                          %(side)s, %(contracts)s, %(price)s, %(fair_prob)s, %(edge)s,
                          %(minutes_left)s, %(dry_run)s, %(order_id)s,
-                         %(vol_used)s, %(drift_used)s, %(spot_at_placement)s)
+                         %(vol_used)s, %(drift_used)s, %(spot_at_placement)s,
+                         %(kind)s, %(floor_strike)s, %(cap_strike)s)
                 """, row)
             conn.commit()
 
